@@ -1,0 +1,97 @@
+<#
+================================================================================
+Firefox Silent Install / Update Script
+
+HOW TO UPDATE FOR A NEW FIREFOX VERSION:
+----------------------------------------
+When Mozilla releases a new version of Firefox, you ONLY need to update
+the version number in TWO places below:
+
+1) $TargetVersion
+2) The version number embedded in $DownloadUrl
+
+As long as those two values match, the script will continue to work
+without any other changes.
+
+Example:
+- Change 145.0.1 to 146.0.0 in BOTH places
+================================================================================
+#>
+
+# Target Firefox version you want installed
+$TargetVersion = [Version] "145.0.1"
+
+# Firefox download URL (must match the TargetVersion above)
+$DownloadUrl = "https://download.mozilla.org/?product=firefox-145.0.1-ssl&os=win64&lang=en-US"
+
+# Local path where the installer will be downloaded
+$LocalInstaller = "C:\Temp\Firefox Installer.exe"
+
+# -------------------------------------------------------------------------
+# Ensure the destination directory exists
+# -------------------------------------------------------------------------
+$destDir = Split-Path $LocalInstaller -Parent
+if (-not (Test-Path $destDir)) {
+    New-Item -ItemType Directory -Path $destDir -Force | Out-Null
+}
+
+# -------------------------------------------------------------------------
+# Download the Firefox installer
+# -------------------------------------------------------------------------
+Write-Host "Downloading Firefox $TargetVersion installer..."
+try {
+    Invoke-WebRequest -Uri $DownloadUrl -OutFile $LocalInstaller -UseBasicParsing -ErrorAction Stop
+} catch {
+    Write-Error "Download failed: $_"
+    exit 1
+}
+
+# -------------------------------------------------------------------------
+# Function to silently install Firefox
+# -ms = silent install
+# -------------------------------------------------------------------------
+function Install-Firefox {
+    Write-Host "Running installer..."
+    Start-Process -FilePath $LocalInstaller -ArgumentList "-ms" -Wait -NoNewWindow
+}
+
+# -------------------------------------------------------------------------
+# Detect existing Firefox installation via registry
+# -------------------------------------------------------------------------
+$firefoxExePath = $null
+try {
+    $reg = Get-ItemProperty `
+        -Path "HKLM:\Software\Microsoft\Windows\CurrentVersion\App Paths\firefox.exe" `
+        -ErrorAction Stop
+    $firefoxExePath = $reg.Path
+} catch {
+    # Firefox not found in registry
+}
+
+# -------------------------------------------------------------------------
+# If Firefox is not installed, install target version and exit
+# -------------------------------------------------------------------------
+if (-not $firefoxExePath -or -not (Test-Path $firefoxExePath)) {
+    Write-Host "Firefox not installed. Installing version $TargetVersion..."
+    Install-Firefox
+    exit 0
+}
+
+# -------------------------------------------------------------------------
+# Read installed Firefox version from executable metadata
+# -------------------------------------------------------------------------
+$installedVersionString = (Get-Item $firefoxExePath).VersionInfo.ProductVersion
+$installedVersion = [Version] $installedVersionString
+
+Write-Host "Installed version: $installedVersion"
+Write-Host "Target version:    $TargetVersion"
+
+# -------------------------------------------------------------------------
+# Compare installed version to target version
+# -------------------------------------------------------------------------
+if ($installedVersion -lt $TargetVersion) {
+    Write-Host "Installed version is older than target. Updating..."
+    Install-Firefox
+} else {
+    Write-Host "Installed version is equal or newer. No action needed."
+}
