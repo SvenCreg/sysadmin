@@ -14,15 +14,15 @@ As long as those two values match, the script will continue to work
 without any other changes.
 
 Example:
-- Change 145.0.1 to 146.0.0 in BOTH places
+- Change 146.0.0 to 146.0.1 in BOTH places
 ================================================================================
 #>
 
 # Target Firefox version you want installed
-$TargetVersion = [Version] "145.0.1"
+$TargetVersion = [Version] "146.0.0"
 
 # Firefox download URL (must match the TargetVersion above)
-$DownloadUrl = "https://download.mozilla.org/?product=firefox-145.0.1-ssl&os=win64&lang=en-US"
+$DownloadUrl = "https://download.mozilla.org/?product=firefox-146.0.0-ssl&os=win64&lang=en-US"
 
 # Local path where the installer will be downloaded
 $LocalInstaller = "C:\Temp\Firefox Installer.exe"
