@@ -1,14 +1,15 @@
 # Chrome Enterprise MSI Updater for ConnectWise RMM
-# Silent, no user interaction, preserves user settings
-# Reports: Updated / Already current / Failed
+# Silent, no user interaction
+# Updates Chrome ONLY if already installed
+# Reports: Updated / Already current / Not installed / Failed
 #
 # ============================================================
 # MAINTENANCE NOTE – UPDATING CHROME VERSION / DOWNLOAD LINK
 # ============================================================
-# If Google changes the download target OR you need to refresh
-# the direct download link:
+# If Google releases a new Chrome Enterprise version OR the download
+# stops working:
 #
-# 1) Go here:
+# 1) Go to:
 #    https://chromeenterprise.google/intl/en_ca/download/
 #
 # 2) Choose:
@@ -19,7 +20,7 @@
 # 3) Copy the DIRECT link for:
 #    GoogleChromeEnterpriseBundle64.zip
 #
-# 4) Paste it into $downloadUrl in Section 2.
+# 4) Update $downloadUrl in Section 2 with that direct link.
 #
 # Once you update $downloadUrl, the rest of the script stays the same.
 # ============================================================
@@ -46,45 +47,44 @@ function Get-ChromeVersion {
 }
 
 ###############################################
-# 1. Get current local version (if installed)
+# 1. Detect Chrome – EXIT if not installed
 ###############################################
 $oldVersion = Get-ChromeVersion
-if ($oldVersion) {
-    Write-Output "Current Chrome version (local): $oldVersion"
-} else {
-    Write-Output "Chrome not currently detected; proceeding with fresh install."
+
+if (-not $oldVersion) {
+    Write-Output "Not installed - Google Chrome is not present. No action taken."
+    exit 0
 }
 
-###############################################
-# 2. Download the Enterprise bundle
-###############################################
-# NOTE:
-# If Chrome fails to update, confirm $downloadUrl is still valid by
-# checking the Chrome Enterprise download page referenced above.
-###############################################
+Write-Output "Current Chrome version (local): $oldVersion"
 
+###############################################
+# 2. Download the Enterprise bundle (ZIP)
+###############################################
 $tempDir = "$env:TEMP\ChromeUpdate"
-$zipPath  = "$tempDir\ChromeBundle.zip"
-$msiPath  = "$tempDir\GoogleChromeStandaloneEnterprise64.msi"
+$zipPath = "$tempDir\ChromeBundle.zip"
+
+# MSI is located under the Installers folder in the ZIP
+$msiPath = Join-Path $tempDir "Installers\GoogleChromeStandaloneEnterprise64.msi"
 
 if (Test-Path $tempDir) { Remove-Item -Recurse -Force $tempDir }
 New-Item -ItemType Directory -Path $tempDir | Out-Null
 
-# Clean direct link (no encoded quote at the end)
-$downloadUrl = "https://dl.google.com/dl/chrome/install/GoogleChromeEnterpriseBundle64.zip"
+# Update this URL when a new version is released
+$downloadUrl = "https://dl.google.com/chrome/install/GoogleChromeEnterpriseBundle64.zip"
 
 Write-Output "Downloading Chrome Enterprise bundle..."
 Invoke-WebRequest -Uri $downloadUrl -OutFile $zipPath
 
 ###############################################
-# 3. Extract the MSI only
+# 3. Extract the MSI from the bundle
 ###############################################
 Write-Output "Extracting MSI from bundle..."
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 [System.IO.Compression.ZipFile]::ExtractToDirectory($zipPath, $tempDir)
 
 if (-not (Test-Path $msiPath)) {
-    Write-Output "Failed - MSI not found inside downloaded ZIP."
+    Write-Output "Failed - MSI not found inside downloaded ZIP (expected under .\Installers)."
     Remove-Item -Recurse -Force $tempDir
     exit 1
 }
@@ -92,10 +92,10 @@ if (-not (Test-Path $msiPath)) {
 ###############################################
 # 4. Install / Upgrade Chrome using MSI (silent)
 ###############################################
-Write-Output "Installing Chrome Enterprise MSI silently..."
-# /qn                     = completely silent, no UI
-# REBOOT=ReallySuppress   = never reboot or prompt
-# DO_NOT_LAUNCH_CHROME=1  = prevents Chrome from auto-launching after install
+Write-Output "Updating Chrome Enterprise MSI silently..."
+# /qn                     = completely silent
+# REBOOT=ReallySuppress   = never reboot
+# DO_NOT_LAUNCH_CHROME=1  = prevent auto-launch
 $arguments = "/i `"$msiPath`" /qn REBOOT=ReallySuppress DO_NOT_LAUNCH_CHROME=1"
 
 $process  = Start-Process "msiexec.exe" -ArgumentList $arguments -Wait -PassThru
@@ -114,13 +114,14 @@ if ($exitCode -ne 0) {
 ###############################################
 Start-Sleep -Seconds 3
 $newVersion = Get-ChromeVersion
+
 if (-not $newVersion) {
-    Write-Output "Failed - Chrome not detected after installation."
+    Write-Output "Failed - Chrome missing after update attempt."
     Remove-Item -Recurse -Force $tempDir
     exit 1
 }
 
-Write-Output "Chrome version after MSI install: $newVersion"
+Write-Output "Chrome version after update: $newVersion"
 
 ###############################################
 # 6. Cleanup
@@ -128,37 +129,28 @@ Write-Output "Chrome version after MSI install: $newVersion"
 Remove-Item -Recurse -Force $tempDir
 
 ###############################################
-# 7. Decide: Updated / Already current / Failed
+# 7. Decide: Updated / Already current
 ###############################################
-if ($oldVersion -and $newVersion) {
-    try {
-        $vOld = [version]$oldVersion
-        $vNew = [version]$newVersion
+try {
+    $vOld = [version]$oldVersion
+    $vNew = [version]$newVersion
 
-        if ($vNew -gt $vOld) {
-            Write-Output "Updated - Chrome upgraded from $oldVersion to $newVersion."
-            exit 0
-        }
-
-        if ($vNew -eq $vOld) {
-            Write-Output "Already current - Chrome remains at $newVersion."
-            exit 0
-        }
-    } catch {
-        # fallback string compare
-        if ($newVersion -ne $oldVersion) {
-            Write-Output "Updated - Chrome upgraded."
-            exit 0
-        } else {
-            Write-Output "Already current - Chrome unchanged."
-            exit 0
-        }
+    if ($vNew -gt $vOld) {
+        Write-Output "Updated - Chrome upgraded from $oldVersion to $newVersion."
+        exit 0
     }
-} else {
-    # No previous version, but Chrome exists now
-    Write-Output "Updated - Chrome installed with version $newVersion."
-    exit 0
-}
 
-Write-Output "Failed - Unable to determine Chrome version change."
-exit 1
+    if ($vNew -eq $vOld) {
+        Write-Output "Already current - Chrome remains at $newVersion."
+        exit 0
+    }
+}
+catch {
+    if ($newVersion -ne $oldVersion) {
+        Write-Output "Updated - Chrome upgraded."
+        exit 0
+    } else {
+        Write-Output "Already current - Chrome unchanged."
+        exit 0
+    }
+}
