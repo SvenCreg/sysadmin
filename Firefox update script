@@ -1,31 +1,67 @@
 <#
 ================================================================================
-Firefox Silent Install / Update Script
+Firefox Silent Install / Update Script (UPDATE-ONLY)
+
+This script will:
+- ONLY update existing Firefox installations
+- NOT install Firefox if it is missing
 
 HOW TO UPDATE FOR A NEW FIREFOX VERSION:
 ----------------------------------------
-When Mozilla releases a new version of Firefox, you ONLY need to update
-the version number in TWO places below:
-
+Update these two values ONLY:
 1) $TargetVersion
-2) The version number embedded in $DownloadUrl
-
-As long as those two values match, the script will continue to work
-without any other changes.
-
-Example:
-- Change 146.0.0 to 146.0.1 in BOTH places
+2) Version embedded in $DownloadUrl
 ================================================================================
 #>
 
 # Target Firefox version you want installed
-$TargetVersion = [Version] "146.0.0"
+$TargetVersion = [Version] "146.0"
 
 # Firefox download URL (must match the TargetVersion above)
-$DownloadUrl = "https://download.mozilla.org/?product=firefox-146.0.0-ssl&os=win64&lang=en-US"
+$DownloadUrl = "https://download.mozilla.org/?product=firefox-146.0-ssl&os=win64&lang=en-US"
 
 # Local path where the installer will be downloaded
 $LocalInstaller = "C:\Temp\Firefox Installer.exe"
+
+# -------------------------------------------------------------------------
+# Detect existing Firefox installation via registry
+# -------------------------------------------------------------------------
+$firefoxExePath = $null
+try {
+    $reg = Get-ItemProperty `
+        -Path "HKLM:\Software\Microsoft\Windows\CurrentVersion\App Paths\firefox.exe" `
+        -ErrorAction Stop
+    $firefoxExePath = $reg.Path
+} catch {
+    # Firefox not found
+}
+
+# -------------------------------------------------------------------------
+# Exit if Firefox is NOT installed
+# -------------------------------------------------------------------------
+if (-not $firefoxExePath -or -not (Test-Path $firefoxExePath)) {
+    Write-Host "Firefox is not installed. No action taken."
+    exit 0
+}
+
+# -------------------------------------------------------------------------
+# Read installed Firefox version
+# -------------------------------------------------------------------------
+$installedVersionString = (Get-Item $firefoxExePath).VersionInfo.ProductVersion
+$installedVersion = [Version] $installedVersionString
+
+Write-Host "Installed version: $installedVersion"
+Write-Host "Target version:    $TargetVersion"
+
+# -------------------------------------------------------------------------
+# Compare versions
+# -------------------------------------------------------------------------
+if ($installedVersion -ge $TargetVersion) {
+    Write-Host "Installed version is up to date. No action needed."
+    exit 0
+}
+
+Write-Host "Installed version is older. Updating Firefox..."
 
 # -------------------------------------------------------------------------
 # Ensure the destination directory exists
@@ -47,51 +83,7 @@ try {
 }
 
 # -------------------------------------------------------------------------
-# Function to silently install Firefox
-# -ms = silent install
+# Silently run the installer (update only)
 # -------------------------------------------------------------------------
-function Install-Firefox {
-    Write-Host "Running installer..."
-    Start-Process -FilePath $LocalInstaller -ArgumentList "-ms" -Wait -NoNewWindow
-}
-
-# -------------------------------------------------------------------------
-# Detect existing Firefox installation via registry
-# -------------------------------------------------------------------------
-$firefoxExePath = $null
-try {
-    $reg = Get-ItemProperty `
-        -Path "HKLM:\Software\Microsoft\Windows\CurrentVersion\App Paths\firefox.exe" `
-        -ErrorAction Stop
-    $firefoxExePath = $reg.Path
-} catch {
-    # Firefox not found in registry
-}
-
-# -------------------------------------------------------------------------
-# If Firefox is not installed, install target version and exit
-# -------------------------------------------------------------------------
-if (-not $firefoxExePath -or -not (Test-Path $firefoxExePath)) {
-    Write-Host "Firefox not installed. Installing version $TargetVersion..."
-    Install-Firefox
-    exit 0
-}
-
-# -------------------------------------------------------------------------
-# Read installed Firefox version from executable metadata
-# -------------------------------------------------------------------------
-$installedVersionString = (Get-Item $firefoxExePath).VersionInfo.ProductVersion
-$installedVersion = [Version] $installedVersionString
-
-Write-Host "Installed version: $installedVersion"
-Write-Host "Target version:    $TargetVersion"
-
-# -------------------------------------------------------------------------
-# Compare installed version to target version
-# -------------------------------------------------------------------------
-if ($installedVersion -lt $TargetVersion) {
-    Write-Host "Installed version is older than target. Updating..."
-    Install-Firefox
-} else {
-    Write-Host "Installed version is equal or newer. No action needed."
-}
+Write-Host "Running installer..."
+Start-Process -FilePath $LocalInstaller -ArgumentList "-ms" -Wait -NoNewWindow
