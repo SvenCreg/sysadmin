@@ -87,3 +87,11 @@ try {
 # -------------------------------------------------------------------------
 Write-Host "Running installer..."
 Start-Process -FilePath $LocalInstaller -ArgumentList "-ms" -Wait -NoNewWindow
+
+# -------------------------------------------------------------------------
+# Clean up installer file
+# -------------------------------------------------------------------------
+if (Test-Path $LocalInstaller) {
+    Write-Host "Cleaning up installer file..."
+    Remove-Item -Path $LocalInstaller -Force -ErrorAction SilentlyContinue
+}
