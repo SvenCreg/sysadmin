@@ -87,7 +87,7 @@ if ($latestVersion) {
 
     try {
         if ([version]$oldVersion -ge [version]$latestVersion) {
-            Write-Output "Already current - Installed version is up to date."
+            Write-Output "Already current MSI version - Installed version is up to date."
             exit 0
         }
     }
