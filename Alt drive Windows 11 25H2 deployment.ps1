@@ -1,6 +1,6 @@
 # ==========================================================
 # Silent in-place upgrade to Windows 11 25H2 using ISO
-# - Downloads ISO to D:\Temp
+# - Downloads ISO to D:\Temp using BITS with retries
 # - Mounts it
 # - Runs setup.exe silently with specified args
 # - No user interaction, no forced reboot
@@ -16,6 +16,8 @@ $isoPath  = Join-Path $workRoot "Win11_25H2_English_x64.iso"
 $logRoot  = Join-Path $workRoot "Logs"
 
 $minimumFreeSpaceGB = 20
+$maxDownloadAttempts = 3
+$downloadRetryDelaySeconds = 30
 
 # ===== FUNCTIONS =====
 
@@ -124,6 +126,62 @@ function Dismount-IsoSafely {
     }
 }
 
+function Stop-ExistingBitsJobs {
+    try {
+        $existingJobs = Get-BitsTransfer -AllUsers -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -eq "Windows 11 25H2 ISO Download" }
+
+        foreach ($job in $existingJobs) {
+            Write-Log ("Removing existing BITS job: {0}" -f $job.DisplayName)
+            Remove-BitsTransfer -BitsJob $job -Confirm:$false -ErrorAction SilentlyContinue
+        }
+    } catch {
+        Write-Log ("Failed to remove existing BITS jobs: {0}" -f $_.Exception.Message)
+    }
+}
+
+function Download-IsoWithBits {
+    $downloadSucceeded = $false
+
+    for ($attempt = 1; $attempt -le $maxDownloadAttempts; $attempt++) {
+        try {
+            Write-Log ("Downloading Windows 11 25H2 ISO using BITS. Attempt {0} of {1}..." -f $attempt, $maxDownloadAttempts)
+            Write-Log ("Download URL: {0}" -f $isoUrl)
+
+            Stop-ExistingBitsJobs
+
+            if (Test-Path $isoPath) {
+                Write-Log "Existing partial or previous ISO found. Removing it before download."
+                Remove-Item $isoPath -Force -ErrorAction SilentlyContinue
+            }
+
+            Start-BitsTransfer `
+                -Source $isoUrl `
+                -Destination $isoPath `
+                -DisplayName "Windows 11 25H2 ISO Download" `
+                -Description "Downloading Windows 11 25H2 ISO for in-place upgrade" `
+                -TransferType Download `
+                -ErrorAction Stop
+
+            Write-Log ("Download complete: {0}" -f $isoPath)
+
+            $downloadSucceeded = $true
+            break
+        } catch {
+            Write-Log ("Download attempt {0} failed: {1}" -f $attempt, $_.Exception.Message)
+
+            Stop-ExistingBitsJobs
+
+            if ($attempt -lt $maxDownloadAttempts) {
+                Write-Log ("Retrying download in {0} seconds..." -f $downloadRetryDelaySeconds)
+                Start-Sleep -Seconds $downloadRetryDelaySeconds
+            }
+        }
+    }
+
+    return $downloadSucceeded
+}
+
 # ===== MAIN LOGIC =====
 
 # Ensure working/log directory exists early
@@ -193,23 +251,14 @@ if ($isoUrl -like "*REPLACE.ME*") {
     exit 1
 }
 
-# Download ISO
-try {
-    Write-Log "Downloading Windows 11 25H2 ISO to D: drive..."
-    Write-Log ("Download URL: {0}" -f $isoUrl)
-
-    Invoke-WebRequest -Uri $isoUrl -OutFile $isoPath -UseBasicParsing -ErrorAction Stop
-
-    Write-Log ("Download complete: {0}" -f $isoPath)
-} catch {
-    Write-Log ("Failed to download ISO: {0}" -f $_.Exception.Message)
-    Preserve-SetupLogs
+# Download ISO using BITS with retries
+if (-not (Download-IsoWithBits)) {
+    Write-Log "ISO download failed after all retry attempts. Aborting."
     exit 1
 }
 
 if (-not (Test-Path $isoPath)) {
     Write-Log ("ISO not found at {0}. Aborting." -f $isoPath)
-    Preserve-SetupLogs
     exit 1
 }
 
@@ -248,7 +297,6 @@ try {
     Write-Log ("ISO mounted as drive {0}:" -f $driveLetter)
 } catch {
     Write-Log ("Failed to mount ISO: {0}" -f $_.Exception.Message)
-    Preserve-SetupLogs
     exit 1
 }
 
@@ -258,7 +306,6 @@ $setupPath = ("{0}:\setup.exe" -f $driveLetter)
 if (-not (Test-Path $setupPath)) {
     Write-Log ("setup.exe not found at {0}. Aborting." -f $setupPath)
     Dismount-IsoSafely
-    Preserve-SetupLogs
     exit 1
 }
 
@@ -324,7 +371,7 @@ try {
     $exitCode = 1
 }
 
-# Always try to preserve logs before cleanup or exit
+# Always try to preserve setup logs before cleanup or exit
 Preserve-SetupLogs
 
 # Dismount ISO
