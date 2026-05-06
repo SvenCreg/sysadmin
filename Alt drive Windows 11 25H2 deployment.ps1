@@ -41,6 +41,15 @@ function Write-Log {
     }
 }
 
+function Convert-ExitCodeToHex {
+    param (
+        [Parameter(Mandatory = $true)]
+        [int]$ExitCode
+    )
+
+    return ("0x{0:X8}" -f ([uint32]$ExitCode))
+}
+
 function Test-IsAdmin {
     try {
         $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -101,10 +110,15 @@ function Preserve-SetupLogs {
             New-Item -Path $logRoot -ItemType Directory -Force | Out-Null
         }
 
-        $pantherPath = "C:\$WINDOWS.~BT\Sources\Panther"
+        $pantherPath = "C:\`$WINDOWS.~BT\Sources\Panther"
 
         if (Test-Path $pantherPath) {
             $destination = Join-Path $logRoot "Panther"
+
+            if (Test-Path $destination) {
+                Remove-Item $destination -Recurse -Force -ErrorAction SilentlyContinue
+            }
+
             Copy-Item -Path $pantherPath -Destination $destination -Recurse -Force -ErrorAction SilentlyContinue
             Write-Log ("Copied Panther logs to: {0}" -f $destination)
         } else {
@@ -118,7 +132,7 @@ function Preserve-SetupLogs {
 function Dismount-IsoSafely {
     try {
         if (Test-Path $isoPath) {
-            Dismount-DiskImage -ImagePath $isoPath -ErrorAction SilentlyContinue
+            Dismount-DiskImage -ImagePath $isoPath -ErrorAction SilentlyContinue | Out-Null
             Write-Log "ISO dismounted."
         }
     } catch {
@@ -309,8 +323,9 @@ if (-not (Test-Path $setupPath)) {
     exit 1
 }
 
-# Optional compatibility scan
-# This helps detect blockers before attempting the real upgrade.
+# Compatibility scan
+# Important:
+# For /Compat ScanOnly, 0xC1900210 means the scan completed and no compatibility issues were found.
 Write-Log "Starting Windows Setup compatibility scan..."
 
 $compatArgs = "/Auto Upgrade /Quiet /Compat ScanOnly /DynamicUpdate Disable /Telemetry Disable /Eula Accept"
@@ -318,14 +333,53 @@ $compatArgs = "/Auto Upgrade /Quiet /Compat ScanOnly /DynamicUpdate Disable /Tel
 try {
     $compatProcess = Start-Process -FilePath $setupPath -ArgumentList $compatArgs -Wait -PassThru
     $compatExitCode = $compatProcess.ExitCode
+    $compatExitCodeHex = Convert-ExitCodeToHex -ExitCode $compatExitCode
 
-    Write-Log ("Compatibility scan exit code: {0}" -f $compatExitCode)
+    Write-Log ("Compatibility scan exit code: {0} ({1})" -f $compatExitCode, $compatExitCodeHex)
 
-    if ($compatExitCode -ne 0) {
-        Write-Log "Compatibility scan returned a non-zero exit code. Aborting upgrade attempt."
-        Preserve-SetupLogs
-        Dismount-IsoSafely
-        exit $compatExitCode
+    switch ($compatExitCodeHex) {
+        "0xC1900210" {
+            Write-Log "Compatibility scan completed successfully. No compatibility issues found. Continuing with upgrade."
+        }
+
+        "0x00000000" {
+            Write-Log "Compatibility scan completed with exit code 0. Continuing with upgrade."
+        }
+
+        "0xC1900208" {
+            Write-Log "Compatibility scan found blocking app or driver compatibility issues. Aborting upgrade."
+            Preserve-SetupLogs
+            Dismount-IsoSafely
+            exit $compatExitCode
+        }
+
+        "0xC1900200" {
+            Write-Log "Compatibility scan failed: system does not meet Windows 11 requirements. Aborting upgrade."
+            Preserve-SetupLogs
+            Dismount-IsoSafely
+            exit $compatExitCode
+        }
+
+        "0xC1900204" {
+            Write-Log "Compatibility scan failed: selected migration choice is not available. Check edition, language, or architecture compatibility."
+            Preserve-SetupLogs
+            Dismount-IsoSafely
+            exit $compatExitCode
+        }
+
+        "0xC190020E" {
+            Write-Log "Compatibility scan failed: insufficient disk space for installation. Aborting upgrade."
+            Preserve-SetupLogs
+            Dismount-IsoSafely
+            exit $compatExitCode
+        }
+
+        default {
+            Write-Log ("Compatibility scan returned unexpected exit code: {0} ({1}). Aborting upgrade." -f $compatExitCode, $compatExitCodeHex)
+            Preserve-SetupLogs
+            Dismount-IsoSafely
+            exit $compatExitCode
+        }
     }
 } catch {
     Write-Log ("Failed to run compatibility scan: {0}" -f $_.Exception.Message)
@@ -346,22 +400,23 @@ $exitCode = 1
 try {
     $process = Start-Process -FilePath $setupPath -ArgumentList $setupArgs -Wait -PassThru
     $exitCode = $process.ExitCode
+    $exitCodeHex = Convert-ExitCodeToHex -ExitCode $exitCode
 
-    Write-Log ("setup.exe exit code: {0}" -f $exitCode)
+    Write-Log ("setup.exe exit code: {0} ({1})" -f $exitCode, $exitCodeHex)
 
     switch ($exitCode) {
         0 {
-            Write-Log "Upgrade completed successfully. Reboot required."
+            Write-Log "Upgrade command completed successfully. Reboot required."
             $success = $true
         }
 
         3010 {
-            Write-Log "Upgrade completed successfully. Reboot required."
+            Write-Log "Upgrade command completed successfully. Reboot required."
             $success = $true
         }
 
         default {
-            Write-Log ("Upgrade failed or returned unexpected exit code: {0}. Check Panther logs." -f $exitCode)
+            Write-Log ("Upgrade failed or returned unexpected exit code: {0} ({1}). Check Panther logs." -f $exitCode, $exitCodeHex)
             $success = $false
         }
     }
