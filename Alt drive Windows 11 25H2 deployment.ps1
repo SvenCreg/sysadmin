@@ -3,6 +3,7 @@
 # - Downloads ISO to D:\Temp using BITS with retries
 # - Mounts it
 # - Runs setup.exe silently with specified args
+# - Uses D: as Windows Setup temp drive where supported
 # - No user interaction, no forced reboot
 # - Preserves files/logs on failure for troubleshooting
 # - Cleans up ISO and temp folder only on success or if already upgraded
@@ -16,8 +17,13 @@ $isoPath  = Join-Path $workRoot "Win11_25H2_English_x64.iso"
 $logRoot  = Join-Path $workRoot "Logs"
 
 $minimumFreeSpaceGB = 20
+$minimumSystemDriveFreeSpaceGB = 20
+
 $maxDownloadAttempts = 3
 $downloadRetryDelaySeconds = 30
+
+# Used by Windows Setup for temporary installation files
+$tempDriveLetter = "D"
 
 # ===== FUNCTIONS =====
 
@@ -47,7 +53,12 @@ function Convert-ExitCodeToHex {
         [int]$ExitCode
     )
 
-    return ("0x{0:X8}" -f ([uint32]$ExitCode))
+    $unsignedExitCode = [System.BitConverter]::ToUInt32(
+        [System.BitConverter]::GetBytes($ExitCode),
+        0
+    )
+
+    return ("0x{0:X8}" -f $unsignedExitCode)
 }
 
 function Test-IsAdmin {
@@ -243,19 +254,37 @@ if (-not (Test-Path "D:\")) {
     exit 1
 }
 
-# Validate free space
+# Validate temp drive free space
 try {
-    $drive = Get-PSDrive -Name D -ErrorAction Stop
-    $freeSpaceGB = [math]::Round(($drive.Free / 1GB), 2)
+    $tempDrive = Get-PSDrive -Name $tempDriveLetter -ErrorAction Stop
+    $tempDriveFreeSpaceGB = [math]::Round(($tempDrive.Free / 1GB), 2)
 
-    Write-Log ("D: free space: {0} GB" -f $freeSpaceGB)
+    Write-Log ("{0}: free space: {1} GB" -f $tempDriveLetter, $tempDriveFreeSpaceGB)
 
-    if ($drive.Free -lt ($minimumFreeSpaceGB * 1GB)) {
-        Write-Log ("Not enough free space on D:. Required: {0} GB. Available: {1} GB." -f $minimumFreeSpaceGB, $freeSpaceGB)
+    if ($tempDrive.Free -lt ($minimumFreeSpaceGB * 1GB)) {
+        Write-Log ("Not enough free space on {0}:. Required: {1} GB. Available: {2} GB." -f $tempDriveLetter, $minimumFreeSpaceGB, $tempDriveFreeSpaceGB)
         exit 1
     }
 } catch {
-    Write-Log ("Failed to check free space on D:: {0}" -f $_.Exception.Message)
+    Write-Log ("Failed to check free space on {0}: {1}" -f $tempDriveLetter, $_.Exception.Message)
+    exit 1
+}
+
+# Validate system drive free space
+try {
+    $systemDriveLetter = $env:SystemDrive.TrimEnd(":")
+    $systemDrive = Get-PSDrive -Name $systemDriveLetter -ErrorAction Stop
+    $systemFreeSpaceGB = [math]::Round(($systemDrive.Free / 1GB), 2)
+
+    Write-Log ("{0}: free space: {1} GB" -f $systemDriveLetter, $systemFreeSpaceGB)
+
+    if ($systemDrive.Free -lt ($minimumSystemDriveFreeSpaceGB * 1GB)) {
+        Write-Log ("Not enough free space on {0}:. Required: {1} GB. Available: {2} GB." -f $systemDriveLetter, $minimumSystemDriveFreeSpaceGB, $systemFreeSpaceGB)
+        Write-Log "Even with /TempDrive, Windows Setup still requires free space on the system drive."
+        exit 1
+    }
+} catch {
+    Write-Log ("Failed to check free space on system drive: {0}" -f $_.Exception.Message)
     exit 1
 }
 
@@ -328,7 +357,7 @@ if (-not (Test-Path $setupPath)) {
 # For /Compat ScanOnly, 0xC1900210 means the scan completed and no compatibility issues were found.
 Write-Log "Starting Windows Setup compatibility scan..."
 
-$compatArgs = "/Auto Upgrade /Quiet /Compat ScanOnly /DynamicUpdate Disable /Telemetry Disable /Eula Accept"
+$compatArgs = "/Auto Upgrade /Quiet /Compat ScanOnly /DynamicUpdate Disable /Telemetry Disable /Eula Accept /TempDrive $tempDriveLetter"
 
 try {
     $compatProcess = Start-Process -FilePath $setupPath -ArgumentList $compatArgs -Wait -PassThru
@@ -368,7 +397,8 @@ try {
         }
 
         "0xC190020E" {
-            Write-Log "Compatibility scan failed: insufficient disk space for installation. Aborting upgrade."
+            Write-Log "Compatibility scan failed: insufficient disk space for installation."
+            Write-Log "D: is being used with /TempDrive, but Windows Setup still requires enough free space on the system drive."
             Preserve-SetupLogs
             Dismount-IsoSafely
             exit $compatExitCode
@@ -392,7 +422,7 @@ try {
 Write-Log "Starting silent in-place upgrade to Windows 11 25H2..."
 Write-Log "No UI. No forced reboot."
 
-$setupArgs = "/Auto Upgrade /Quiet /MigrateDrivers All /DynamicUpdate Disable /Telemetry Disable /Compat IgnoreWarning /ShowOOBE None /NoReboot /Eula Accept"
+$setupArgs = "/Auto Upgrade /Quiet /MigrateDrivers All /DynamicUpdate Disable /Telemetry Disable /Compat IgnoreWarning /ShowOOBE None /NoReboot /Eula Accept /TempDrive $tempDriveLetter"
 
 $success = $false
 $exitCode = 1
