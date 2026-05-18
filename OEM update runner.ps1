@@ -4,19 +4,9 @@ ConnectWise RMM-safe OEM update runner
 - Lenovo System Update
 - HP Image Assistant
 
-Paste directly into a ConnectWise RMM PowerShell script.
 Run as System/Admin.
 Do not enable auto reboot.
 Recommended timeout: 120 minutes or higher.
-
-Notes:
-- Dell BIOS/Firmware are excluded by default.
-- Lenovo reboot-required packages are excluded by default.
-- HP BIOS/Firmware are excluded by default unless HPCategoryMode is set to All.
-- Dell, Lenovo, and HP tools can be downloaded/installed automatically if missing.
-- Lenovo history parsing is best-effort because Lenovo log/WMI output varies by System Update version.
-- Lenovo artifact discovery inventories recent Lenovo-related files after TVSU runs.
-- Lenovo key artifacts are copied into the RMM log folder for review.
 #>
 
 # ============================================================
@@ -35,14 +25,11 @@ $InstallHPImageAssistantIfMissing = $true
 $IncludeDellBiosFirmware = $false
 $IncludeLenovoRebootPackages = $false
 
-# Lenovo debug/history discovery settings
 $EnableLenovoDebugLogging = $true
 $LenovoArtifactLookbackMinutes = 15
 $LenovoArtifactInventoryMaxItems = 300
 $LenovoArtifactParseMaxDetailLines = 40
 
-# If true, Dell will retry /applyUpdates without -updateType if Dell rejects all filtered attempts with exit code 107.
-# Warning: unfiltered Dell apply may include BIOS/firmware updates. The script still uses -reboot=disable.
 $AllowDellNoUpdateTypeFallback = $false
 
 $VendorTimeoutMinutes = 120
@@ -609,6 +596,7 @@ function Copy-LenovoKeyArtifacts {
     }
     catch {
         Write-Log "Could not create Lenovo key artifact folder $copyDir`: $($_.Exception.Message)" "WARN"
+
         return [pscustomobject]@{
             CopyDir = $copyDir
             CopiedFiles = $copiedFiles
@@ -659,10 +647,10 @@ function Get-LenovoUpdateTaskListSummary {
 
     $samples = New-Object System.Collections.Generic.List[string]
 
-    $taskListFile = @($Files |
+    $taskListFile = $Files |
         Where-Object { $_.FullName -match "(?i)\\UpdateTaskList\.xml$" } |
         Sort-Object LastWriteTime -Descending |
-        Select-Object -First 1)
+        Select-Object -First 1
 
     if (-not $taskListFile) {
         return [pscustomobject]@{
@@ -738,55 +726,111 @@ function Get-LenovoUpdateTaskListSummary {
 
         $childElementCount = $childElements.Count
 
-        $taskLikeElements = @($childElements | Where-Object {
-            $_.LocalName -match "(?i)task|update|package|install|driver|firmware|software|reboot|dependency"
-        })
+        $containerNames = @(
+            "UpateTaskListInfo",
+            "UpdateTaskListInfo",
+            "UpdateTaskList",
+            "UpdateStatusList",
+            "StatusList",
+            "TaskList",
+            "PackageList",
+            "Updates",
+            "Packages"
+        )
 
-        $taskLikeElementCount = $taskLikeElements.Count
+        $realTaskLikeElements = @($childElements | Where-Object {
+            $localName = $_.LocalName
+            $isContainer = $containerNames -contains $localName
+            $nameLooksLikeTask = $localName -match "(?i)task|status|update|package|install|driver|firmware|software|dependency|reboot"
 
-        foreach ($node in $taskLikeElements) {
-            if ($samples.Count -ge $MaxSamples) {
-                break
-            }
-
-            $sampleParts = New-Object System.Collections.Generic.List[string]
-            [void]$sampleParts.Add("Element=$($node.LocalName)")
-
-            if ($node.Attributes) {
-                foreach ($attrName in @("name","title","id","package","version","severity","status","result","reboot","type")) {
-                    $attr = $node.Attributes[$attrName]
-
-                    if ($attr -and $attr.Value) {
-                        [void]$sampleParts.Add("$attrName=$($attr.Value)")
-                    }
-                }
-            }
-
-            $inner = ""
+            $attributeCount = 0
             try {
-                $inner = ($node.InnerText -replace "\s+", " ").Trim()
+                if ($_.Attributes) {
+                    $attributeCount = $_.Attributes.Count
+                }
             }
             catch {}
 
-            if ($inner -and $inner.Length -le 200) {
-                [void]$sampleParts.Add("Text=$inner")
+            $elementChildCount = 0
+            try {
+                $elementChildCount = @($_.ChildNodes | Where-Object { $_.NodeType -eq [System.Xml.XmlNodeType]::Element }).Count
+            }
+            catch {}
+
+            $textValue = ""
+            try {
+                $textValue = ($_.InnerText -replace "\s+", " ").Trim()
+            }
+            catch {}
+
+            $hasUsefulContent = $false
+
+            if ($attributeCount -gt 0) {
+                $hasUsefulContent = $true
             }
 
-            [void]$samples.Add(($sampleParts -join "; "))
+            if ($elementChildCount -gt 0 -and -not $isContainer) {
+                $hasUsefulContent = $true
+            }
+
+            if ($textValue -and $textValue.Length -gt 0 -and -not $isContainer) {
+                $hasUsefulContent = $true
+            }
+
+            (-not $isContainer) -and $nameLooksLikeTask -and $hasUsefulContent
+        })
+
+        $taskLikeElementCount = $realTaskLikeElements.Count
+
+        if ($taskLikeElementCount -gt 0) {
+            foreach ($node in $realTaskLikeElements) {
+                if ($samples.Count -ge $MaxSamples) {
+                    break
+                }
+
+                $sampleParts = New-Object System.Collections.Generic.List[string]
+                [void]$sampleParts.Add("Element=$($node.LocalName)")
+
+                if ($node.Attributes) {
+                    foreach ($attrName in @("name","title","id","package","version","severity","status","result","reboot","type")) {
+                        $attr = $node.Attributes[$attrName]
+
+                        if ($attr -and $attr.Value) {
+                            [void]$sampleParts.Add("$attrName=$($attr.Value)")
+                        }
+                    }
+                }
+
+                $inner = ""
+                try {
+                    $inner = ($node.InnerText -replace "\s+", " ").Trim()
+                }
+                catch {}
+
+                if ($inner -and $inner.Length -le 200) {
+                    [void]$sampleParts.Add("Text=$inner")
+                }
+
+                [void]$samples.Add(($sampleParts -join "; "))
+            }
+        }
+        else {
+            foreach ($node in $childElements) {
+                if ($samples.Count -ge $MaxSamples) {
+                    break
+                }
+
+                [void]$samples.Add("CONTAINER_ONLY: Element=$($node.LocalName)")
+            }
         }
 
-        if ($childElementCount -eq 0) {
+        if ($taskLikeElementCount -eq 0) {
             $isEmpty = $true
-        }
-        elseif ($taskLikeElementCount -eq 0 -and $sizeBytes -lt 2048) {
-            $isEmpty = $true
+            $likelyNoApplicableUpdates = $true
         }
         else {
             $isEmpty = $false
-        }
-
-        if ($isEmpty) {
-            $likelyNoApplicableUpdates = $true
+            $likelyNoApplicableUpdates = $false
         }
     }
     catch {
@@ -1215,9 +1259,7 @@ function Install-LenovoSystemUpdate {
 
     if ($lenovoInstallResult.Success) {
         Start-Sleep -Seconds 20
-
         Set-LenovoSystemUpdateSettings -EnableDebug $EnableLenovoDebugLogging
-
         return $true
     }
 
@@ -1349,8 +1391,6 @@ try {
 
     $installedApps = Get-InstalledAppNames
     $results = @()
-
-    $pf64 = Get-ProgramFiles64
 
     # -----------------------------
     # Dell Command Update
@@ -1573,7 +1613,7 @@ try {
         }
 
         if ($lenovoHistory.LikelyNoApplicableUpdates -and $lenovoResult.ExitCode -eq 1) {
-            Write-Log "Lenovo returned exit code 1, but UpdateTaskList appears empty and no Lenovo package failures were parsed. This likely means no applicable selected non-reboot updates." "WARN"
+            Write-Log "Lenovo returned exit code 1, but UpdateTaskList appears container-only or empty and no Lenovo package failures were parsed. This likely means no applicable selected non-reboot updates." "WARN"
         }
     }
     elseif (($system.Manufacturer -match "Lenovo") -or ($installedApps -match "Lenovo Vantage|Commercial Vantage|LenovoCommercialVantage|Lenovo System Update")) {
