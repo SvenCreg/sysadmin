@@ -92,7 +92,9 @@ $DellCommandUpdateInstallerLocalPath = ""
 
 # Chocolatey fallback is useful when DCU is missing and Dell direct download is blocked.
 # For repair/reinstall, the script first pre-downloads an EXE before uninstalling existing DCU.
-# If Dell EXE download is blocked, Chocolatey repair fallback runs a forced choco upgrade/install WITHOUT uninstalling DCU first.
+# During persistent Dell 3005 repair, Chocolatey is attempted FIRST.
+# If Chocolatey is unavailable/fails, the script tries Dell EXE download sources.
+# The script will not uninstall existing DCU unless a replacement EXE is already cached.
 $UseChocolateyFallbackForDellCommandUpdateInstall = $true
 $UseChocolateyFallbackForDellCommandUpdateRepair = $true
 $ChocolateyDellCommandUpdatePackageId = "dellcommandupdate"
@@ -138,6 +140,7 @@ $global:DellToolBootstrapped = $false
 $global:DellClientManagementServiceRecovered = $false
 $global:DellCommandUpdateRepairAttempted = $false
 $global:DellCommandUpdateRepairSucceeded = $false
+$global:DellStopFurtherApplyAttempts = $false
 
 $global:LenovoToolFound = $false
 $global:LenovoApplyRan = $false
@@ -984,36 +987,9 @@ function Repair-DellCommandUpdate {
 
     $global:DellCommandUpdateRepairAttempted = $true
 
-    Write-Log "Starting Dell Command Update repair/reinstall because persistent DCU service-busy state was detected." "WARN"
+    Write-Log "Starting Dell Command Update repair path because persistent DCU service-busy state was detected." "WARN"
 
     New-Item -ItemType Directory -Path $DownloadFolder -Force | Out-Null
-
-    Write-Log "Pre-downloading Dell Command Update installer before uninstalling existing DCU. Existing DCU will not be removed unless the replacement installer is cached locally first."
-    $preDownloadedDcuInstaller = Get-DellCommandUpdateInstallerFile -DownloadFolder $DownloadFolder
-
-    if (-not $preDownloadedDcuInstaller -or -not (Test-Path -LiteralPath $preDownloadedDcuInstaller)) {
-        Write-Log "Dell Command Update replacement EXE could not be downloaded from Dell sources. Existing DCU will not be uninstalled." "WARN"
-
-        if ($UseChocolateyFallbackForDellCommandUpdateRepair) {
-            Write-Log "Trying Chocolatey fallback repair without uninstalling existing Dell Command Update." "WARN"
-
-            $chocoRepairSucceeded = Install-DellCommandUpdateWithChocolatey -Force
-
-            if ($chocoRepairSucceeded) {
-                [void](Restart-DellClientManagementService `
-                    -ForceStop $DellClientManagementServiceForceStop `
-                    -WaitTimeoutSeconds $DellClientManagementServiceWaitTimeoutSeconds `
-                    -PostStartDelaySeconds $DellClientManagementServicePostStartDelaySeconds)
-
-                $global:DellCommandUpdateRepairSucceeded = $true
-                return $true
-            }
-        }
-
-        Write-Log "Dell Command Update repair aborted because no replacement EXE was cached and Chocolatey repair fallback did not succeed. Existing DCU was not uninstalled." "ERROR"
-        $global:DellCommandUpdateRepairSucceeded = $false
-        return $false
-    }
 
     $svcName = Get-DellClientManagementServiceName
 
@@ -1029,6 +1005,52 @@ function Repair-DellCommandUpdate {
         }
         catch {
             Write-Log "Could not stop Dell Client Management Service before repair: $($_.Exception.Message)" "WARN"
+        }
+    }
+
+    if ($UseChocolateyFallbackForDellCommandUpdateRepair) {
+        Write-Log "Trying Chocolatey Dell Command Update repair/install first."
+        $chocoRepairSucceeded = Install-DellCommandUpdateWithChocolatey -Force
+
+        if ($chocoRepairSucceeded) {
+            Write-Log "Chocolatey Dell Command Update repair/install completed."
+
+            [void](Restart-DellClientManagementService `
+                -ForceStop $DellClientManagementServiceForceStop `
+                -WaitTimeoutSeconds $DellClientManagementServiceWaitTimeoutSeconds `
+                -PostStartDelaySeconds $DellClientManagementServicePostStartDelaySeconds)
+
+            $global:DellCommandUpdateRepairSucceeded = $true
+            return $true
+        }
+
+        Write-Log "Chocolatey Dell Command Update repair/install did not succeed. Trying Dell EXE fallback without uninstalling first." "WARN"
+    }
+    else {
+        Write-Log "Chocolatey Dell Command Update repair is disabled."
+    }
+
+    Write-Log "Pre-downloading and verifying Dell Command Update installer before uninstalling existing DCU. Existing DCU will not be removed unless the replacement installer is cached locally first."
+    $preDownloadedDcuInstaller = Get-DellCommandUpdateInstallerFile -DownloadFolder $DownloadFolder
+
+    if (-not $preDownloadedDcuInstaller -or -not (Test-Path -LiteralPath $preDownloadedDcuInstaller)) {
+        Write-Log "Dell Command Update repair aborted because replacement installer could not be downloaded and verified. Existing DCU will not be uninstalled." "ERROR"
+        $global:DellCommandUpdateRepairSucceeded = $false
+        return $false
+    }
+
+    if ($svcName) {
+        try {
+            Write-Log "Stopping Dell Client Management Service before Dell Command Update uninstall/reinstall."
+            Stop-Service -Name $svcName -Force -ErrorAction SilentlyContinue
+
+            [void](Wait-ServiceStatus `
+                -ServiceName $svcName `
+                -DesiredStatus "Stopped" `
+                -TimeoutSeconds $DellClientManagementServiceWaitTimeoutSeconds)
+        }
+        catch {
+            Write-Log "Could not stop Dell Client Management Service before uninstall/reinstall: $($_.Exception.Message)" "WARN"
         }
     }
 
@@ -1109,6 +1131,18 @@ function Invoke-DellCommandUpdateApplyWithServiceRecovery {
     }
 
     while ($true) {
+        if ($global:DellStopFurtherApplyAttempts) {
+            Write-Log "$displayName skipped because DellStopFurtherApplyAttempts=True." "WARN"
+            return [pscustomobject]@{
+                Tool = $displayName
+                FilePath = $effectiveDellCli
+                ExitCode = $null
+                Ran = $false
+                Success = $false
+                Status = "SkippedAfterPriorDellFailure"
+            }
+        }
+
         if ($serviceRetryAttempt -gt 0) {
             Write-Log "$displayName service recovery retry attempt $serviceRetryAttempt." "WARN"
         }
@@ -1163,6 +1197,7 @@ function Invoke-DellCommandUpdateApplyWithServiceRecovery {
                 if (-not $effectiveDellCli) {
                     Write-Log "Dell Command Update repair reported success, but dcu-cli.exe was not found. Cannot retry $displayName." "ERROR"
                     $global:HadVendorFailure = $true
+                    $global:DellStopFurtherApplyAttempts = $true
                     return $result
                 }
 
@@ -1174,14 +1209,16 @@ function Invoke-DellCommandUpdateApplyWithServiceRecovery {
                 continue
             }
             else {
-                Write-Log "Dell Command Update repair/reinstall failed. Cannot recover from exit code $($result.ExitCode)." "ERROR"
+                Write-Log "Dell Command Update repair failed. Stopping further Dell apply attempts for this run." "ERROR"
                 $global:HadVendorFailure = $true
+                $global:DellStopFurtherApplyAttempts = $true
                 return $result
             }
         }
 
         Write-Log "$displayName returned Dell service-related exit code $($result.ExitCode), but recovery/repair limits have been reached." "WARN"
         $global:HadVendorFailure = $true
+        $global:DellStopFurtherApplyAttempts = $true
         return $result
     }
 }
@@ -2551,6 +2588,11 @@ try {
         $dellAllFilteredAttempts107 = $true
 
         foreach ($dellUpdateType in $dellUpdateTypes) {
+            if ($global:DellStopFurtherApplyAttempts) {
+                Write-Log "Skipping remaining Dell update types because DellStopFurtherApplyAttempts=True." "WARN"
+                break
+            }
+
             $dellApplyLog = Join-Path $dellNativeLogDir "Dell-Apply-$dellUpdateType.log"
 
             Write-Log "Running Dell apply step for update type: $dellUpdateType"
@@ -2581,7 +2623,7 @@ try {
             Write-Log "Dell Command Update log should be here: $dellApplyLog"
         }
 
-        if ($dellAny107 -and $dellAllFilteredAttempts107) {
+        if ($dellAny107 -and $dellAllFilteredAttempts107 -and -not $global:DellStopFurtherApplyAttempts) {
             Write-Log "All Dell filtered update type attempts returned exit code 107." "WARN"
 
             if ($AllowDellNoUpdateTypeFallback) {
@@ -2872,6 +2914,7 @@ try {
     Write-Log "Dell Client Management Service recovered/restarted: $global:DellClientManagementServiceRecovered"
     Write-Log "Dell Command Update repair attempted: $global:DellCommandUpdateRepairAttempted"
     Write-Log "Dell Command Update repair succeeded: $global:DellCommandUpdateRepairSucceeded"
+    Write-Log "Dell stop further apply attempts: $global:DellStopFurtherApplyAttempts"
 
     Write-Log "Lenovo tool found: $global:LenovoToolFound"
     Write-Log "Lenovo tool bootstrapped: $global:LenovoToolBootstrapped"
@@ -2915,6 +2958,7 @@ try {
     Write-Output "OEMUPDATER_DELL_CLIENT_MANAGEMENT_SERVICE_RECOVERED=$global:DellClientManagementServiceRecovered"
     Write-Output "OEMUPDATER_DELL_COMMAND_UPDATE_REPAIR_ATTEMPTED=$global:DellCommandUpdateRepairAttempted"
     Write-Output "OEMUPDATER_DELL_COMMAND_UPDATE_REPAIR_SUCCEEDED=$global:DellCommandUpdateRepairSucceeded"
+    Write-Output "OEMUPDATER_DELL_STOP_FURTHER_APPLY_ATTEMPTS=$global:DellStopFurtherApplyAttempts"
 
     Write-Output "OEMUPDATER_LENOVO_TOOL_FOUND=$global:LenovoToolFound"
     Write-Output "OEMUPDATER_LENOVO_TOOL_BOOTSTRAPPED=$global:LenovoToolBootstrapped"
