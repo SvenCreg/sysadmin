@@ -45,6 +45,13 @@ $DellClientManagementServicePostStartDelaySeconds = 20
 $DellDcuServiceRecoveryExitCodes = @(3000, 3002, 3003, 3004, 3005)
 $DellDcuServiceRecoveryRetries = 1
 
+# Dell Command Update repair/reinstall path for persistent service-busy state
+$RepairDellCommandUpdateOnPersistentServiceBusy = $true
+$DellCommandUpdateRepairOnExitCodes = @(3005)
+$DellCommandUpdateRepairRetriesPerRun = 1
+$DellCommandUpdateUninstallTimeoutMinutes = 15
+$DellCommandUpdateRepairPostInstallDelaySeconds = 30
+
 $EnableLenovoDebugLogging = $true
 $LenovoArtifactLookbackMinutes = 15
 $LenovoArtifactInventoryMaxItems = 300
@@ -99,6 +106,8 @@ $global:DellToolFound = $false
 $global:DellApplyRan = $false
 $global:DellToolBootstrapped = $false
 $global:DellClientManagementServiceRecovered = $false
+$global:DellCommandUpdateRepairAttempted = $false
+$global:DellCommandUpdateRepairSucceeded = $false
 
 $global:LenovoToolFound = $false
 $global:LenovoApplyRan = $false
@@ -442,6 +451,32 @@ function Invoke-LoggedProcess {
     }
 }
 
+function Invoke-CommandLineLogged {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+
+        [Parameter(Mandatory = $true)]
+        [string]$CommandLine,
+
+        [int[]]$SuccessExitCodes = @(0),
+
+        [int[]]$RebootExitCodes = @(3010, 1641),
+
+        [int[]]$WarningExitCodes = @()
+    )
+
+    Write-Log "$Name command line: $CommandLine"
+
+    return Invoke-LoggedProcess `
+        -Name $Name `
+        -FilePath "$env:WINDIR\System32\cmd.exe" `
+        -Arguments @("/d", "/c", $CommandLine) `
+        -SuccessExitCodes $SuccessExitCodes `
+        -RebootExitCodes $RebootExitCodes `
+        -WarningExitCodes $WarningExitCodes
+}
+
 function Wait-ForProcessNames {
     param(
         [Parameter(Mandatory = $true)]
@@ -491,7 +526,7 @@ function Wait-ForProcessNames {
 }
 
 # ============================================================
-# Dell service recovery helpers
+# Dell service recovery and repair helpers
 # ============================================================
 
 function Get-DellClientManagementServiceName {
@@ -661,6 +696,224 @@ function Restart-DellClientManagementService {
     }
 }
 
+function Get-DellCommandUpdateInstalledApp {
+    $matches = [System.Collections.ArrayList]::new()
+    $registryViews = @("Registry64", "Registry32")
+
+    foreach ($view in $registryViews) {
+        try {
+            $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+                [Microsoft.Win32.RegistryHive]::LocalMachine,
+                [Microsoft.Win32.RegistryView]::$view
+            )
+
+            $uninstallKey = $baseKey.OpenSubKey("SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall")
+
+            if (-not $uninstallKey) {
+                continue
+            }
+
+            foreach ($subName in $uninstallKey.GetSubKeyNames()) {
+                $subKey = $uninstallKey.OpenSubKey($subName)
+
+                if (-not $subKey) {
+                    continue
+                }
+
+                $displayName = [string]$subKey.GetValue("DisplayName")
+
+                if (-not $displayName) {
+                    continue
+                }
+
+                if ($displayName -match "^(Dell Command \| Update|Dell Command Update)$") {
+                    [void]$matches.Add([pscustomobject]@{
+                        DisplayName = $displayName
+                        DisplayVersion = [string]$subKey.GetValue("DisplayVersion")
+                        UninstallString = [string]$subKey.GetValue("UninstallString")
+                        QuietUninstallString = [string]$subKey.GetValue("QuietUninstallString")
+                        WindowsInstaller = [string]$subKey.GetValue("WindowsInstaller")
+                        RegistryKeyName = $subName
+                        RegistryView = $view
+                    })
+                }
+            }
+        }
+        catch {
+            Write-Log "Could not inspect Dell Command Update uninstall registry in $view`: $($_.Exception.Message)" "WARN"
+        }
+    }
+
+    return @($matches | Sort-Object DisplayVersion -Descending)
+}
+
+function Uninstall-DellCommandUpdate {
+    param(
+        [int]$TimeoutMinutes = 15
+    )
+
+    $apps = @(Get-DellCommandUpdateInstalledApp)
+
+    if ($apps.Count -eq 0) {
+        Write-Log "Dell Command Update uninstall entry was not found. It may already be removed." "WARN"
+        return $true
+    }
+
+    $allSucceeded = $true
+
+    foreach ($app in $apps) {
+        Write-Log "Dell Command Update uninstall candidate: $($app.DisplayName) $($app.DisplayVersion) [$($app.RegistryView)]"
+
+        $commandLine = $null
+        $guid = $null
+
+        if ($app.RegistryKeyName -match "^\{[0-9A-Fa-f-]{36}\}$") {
+            $guid = $app.RegistryKeyName
+        }
+        elseif ($app.UninstallString -match "\{[0-9A-Fa-f-]{36}\}") {
+            $guid = $Matches[0]
+        }
+
+        if ($guid) {
+            $commandLine = "msiexec.exe /x $guid /qn /norestart"
+        }
+        elseif ($app.QuietUninstallString) {
+            $commandLine = $app.QuietUninstallString
+        }
+        elseif ($app.UninstallString) {
+            if ($app.UninstallString -match "(?i)msiexec") {
+                $commandLine = ($app.UninstallString -replace "(?i)/I", "/x" -replace "(?i)/X", "/x")
+
+                if ($commandLine -notmatch "(?i)/q") {
+                    $commandLine += " /qn"
+                }
+
+                if ($commandLine -notmatch "(?i)norestart") {
+                    $commandLine += " /norestart"
+                }
+            }
+            else {
+                $commandLine = $app.UninstallString
+
+                if ($commandLine -notmatch "(?i)(/quiet|/qn|/s|/silent)") {
+                    $commandLine += " /quiet"
+                }
+
+                if ($commandLine -notmatch "(?i)norestart") {
+                    $commandLine += " /norestart"
+                }
+            }
+        }
+
+        if (-not $commandLine) {
+            Write-Log "Could not determine uninstall command for Dell Command Update entry: $($app.DisplayName)" "WARN"
+            $allSucceeded = $false
+            continue
+        }
+
+        $oldTimeout = $script:VendorTimeoutMinutes
+        $script:VendorTimeoutMinutes = $TimeoutMinutes
+
+        try {
+            $uninstallResult = Invoke-CommandLineLogged `
+                -Name "Dell Command Update Uninstall" `
+                -CommandLine $commandLine `
+                -SuccessExitCodes @(0, 1605, 1614) `
+                -RebootExitCodes @(3010, 1641)
+
+            if (-not $uninstallResult.Success) {
+                Write-Log "Dell Command Update uninstall did not report success. ExitCode=$($uninstallResult.ExitCode)" "WARN"
+                $allSucceeded = $false
+            }
+        }
+        finally {
+            $script:VendorTimeoutMinutes = $oldTimeout
+        }
+    }
+
+    Start-Sleep -Seconds 10
+
+    $remainingCli = Find-DellCommandUpdateCli
+
+    if ($remainingCli) {
+        Write-Log "Dell Command Update CLI still exists after uninstall attempt: $remainingCli" "WARN"
+    }
+    else {
+        Write-Log "Dell Command Update CLI is no longer present after uninstall."
+    }
+
+    return $allSucceeded
+}
+
+function Repair-DellCommandUpdate {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DownloadFolder
+    )
+
+    if ($global:DellCommandUpdateRepairAttempted) {
+        Write-Log "Dell Command Update repair was already attempted during this script run. Skipping another repair." "WARN"
+        return $false
+    }
+
+    $global:DellCommandUpdateRepairAttempted = $true
+
+    Write-Log "Starting Dell Command Update repair/reinstall because persistent DCU service-busy state was detected." "WARN"
+
+    New-Item -ItemType Directory -Path $DownloadFolder -Force | Out-Null
+
+    $svcName = Get-DellClientManagementServiceName
+
+    if ($svcName) {
+        try {
+            Write-Log "Stopping Dell Client Management Service before Dell Command Update repair."
+            Stop-Service -Name $svcName -Force -ErrorAction SilentlyContinue
+
+            [void](Wait-ServiceStatus `
+                -ServiceName $svcName `
+                -DesiredStatus "Stopped" `
+                -TimeoutSeconds $DellClientManagementServiceWaitTimeoutSeconds)
+        }
+        catch {
+            Write-Log "Could not stop Dell Client Management Service before repair: $($_.Exception.Message)" "WARN"
+        }
+    }
+
+    $uninstallSucceeded = Uninstall-DellCommandUpdate -TimeoutMinutes $DellCommandUpdateUninstallTimeoutMinutes
+
+    if (-not $uninstallSucceeded) {
+        Write-Log "Dell Command Update uninstall had warnings or failures. Continuing with reinstall attempt." "WARN"
+    }
+
+    $installed = Install-DellCommandUpdate -DownloadFolder $DownloadFolder
+
+    if (-not $installed) {
+        Write-Log "Dell Command Update repair failed because reinstall did not complete successfully." "ERROR"
+        $global:DellCommandUpdateRepairSucceeded = $false
+        return $false
+    }
+
+    Start-Sleep -Seconds $DellCommandUpdateRepairPostInstallDelaySeconds
+
+    $newCli = Find-DellCommandUpdateCli
+
+    if (-not $newCli) {
+        Write-Log "Dell Command Update repair failed because dcu-cli.exe was not found after reinstall." "ERROR"
+        $global:DellCommandUpdateRepairSucceeded = $false
+        return $false
+    }
+
+    Write-Log "Dell Command Update repair/reinstall completed. New CLI path: $newCli"
+
+    [void](Restart-DellClientManagementService `
+        -ForceStop $DellClientManagementServiceForceStop `
+        -WaitTimeoutSeconds $DellClientManagementServiceWaitTimeoutSeconds `
+        -PostStartDelaySeconds $DellClientManagementServicePostStartDelaySeconds)
+
+    $global:DellCommandUpdateRepairSucceeded = $true
+    return $true
+}
+
 function Invoke-DellCommandUpdateApplyWithServiceRecovery {
     param(
         [Parameter(Mandatory = $true)]
@@ -683,8 +936,14 @@ function Invoke-DellCommandUpdateApplyWithServiceRecovery {
         $arguments = @("/applyUpdates", "-silent", "-reboot=disable", "-updateType=$UpdateType", "-outputLog=$OutputLog")
     }
 
+    $effectiveDellCli = $DellCli
+    $serviceRetryAttempt = 0
+    $repairRetryAttempt = 0
+    $result = $null
+
     if ($RestartDellClientManagementServiceBeforeDellApply -and -not $script:DellClientManagementServiceRestartedThisRun) {
         Write-Log "RestartDellClientManagementServiceBeforeDellApply is enabled. Restarting Dell Client Management Service before DCU apply."
+
         [void](Restart-DellClientManagementService `
             -ForceStop $DellClientManagementServiceForceStop `
             -WaitTimeoutSeconds $DellClientManagementServiceWaitTimeoutSeconds `
@@ -693,17 +952,18 @@ function Invoke-DellCommandUpdateApplyWithServiceRecovery {
         $script:DellClientManagementServiceRestartedThisRun = $true
     }
 
-    $attempt = 0
-    $result = $null
+    while ($true) {
+        if ($serviceRetryAttempt -gt 0) {
+            Write-Log "$displayName service recovery retry attempt $serviceRetryAttempt." "WARN"
+        }
 
-    while ($attempt -le $DellDcuServiceRecoveryRetries) {
-        if ($attempt -gt 0) {
-            Write-Log "$displayName retry attempt $attempt after Dell Client Management Service recovery." "WARN"
+        if ($repairRetryAttempt -gt 0) {
+            Write-Log "$displayName post-repair retry attempt $repairRetryAttempt." "WARN"
         }
 
         $result = Invoke-LoggedProcess `
             -Name $displayName `
-            -FilePath $DellCli `
+            -FilePath $effectiveDellCli `
             -Arguments $arguments `
             -SuccessExitCodes @(0, 500) `
             -RebootExitCodes @(1, 5, 14) `
@@ -718,28 +978,56 @@ function Invoke-DellCommandUpdateApplyWithServiceRecovery {
             return $result
         }
 
-        if (-not $RestartDellClientManagementServiceOnServiceError) {
-            $global:HadVendorFailure = $true
-            return $result
+        if ($RestartDellClientManagementServiceOnServiceError -and $serviceRetryAttempt -lt $DellDcuServiceRecoveryRetries) {
+            Write-Log "$displayName returned Dell service-related exit code $($result.ExitCode). Restarting Dell Client Management Service and retrying." "WARN"
+
+            [void](Restart-DellClientManagementService `
+                -ForceStop $DellClientManagementServiceForceStop `
+                -WaitTimeoutSeconds $DellClientManagementServiceWaitTimeoutSeconds `
+                -PostStartDelaySeconds $DellClientManagementServicePostStartDelaySeconds)
+
+            $serviceRetryAttempt++
+            continue
         }
 
-        if ($attempt -ge $DellDcuServiceRecoveryRetries) {
-            Write-Log "$displayName returned Dell service-related exit code $($result.ExitCode), but retry limit has been reached." "WARN"
-            $global:HadVendorFailure = $true
-            return $result
+        if (
+            $RepairDellCommandUpdateOnPersistentServiceBusy -and
+            ($DellCommandUpdateRepairOnExitCodes -contains $result.ExitCode) -and
+            ($repairRetryAttempt -lt $DellCommandUpdateRepairRetriesPerRun) -and
+            (-not $global:DellCommandUpdateRepairAttempted)
+        ) {
+            Write-Log "$displayName returned persistent Dell service-busy exit code $($result.ExitCode) after service recovery. Starting Dell Command Update repair/reinstall." "WARN"
+
+            $repairDir = Join-Path $RunLogDir "DellCommandUpdateRepair"
+            $repairSucceeded = Repair-DellCommandUpdate -DownloadFolder $repairDir
+
+            if ($repairSucceeded) {
+                $effectiveDellCli = Find-DellCommandUpdateCli
+
+                if (-not $effectiveDellCli) {
+                    Write-Log "Dell Command Update repair reported success, but dcu-cli.exe was not found. Cannot retry $displayName." "ERROR"
+                    $global:HadVendorFailure = $true
+                    return $result
+                }
+
+                $serviceRetryAttempt = 0
+                $repairRetryAttempt++
+                $script:DellClientManagementServiceRestartedThisRun = $true
+
+                Write-Log "Retrying $displayName after Dell Command Update repair/reinstall." "WARN"
+                continue
+            }
+            else {
+                Write-Log "Dell Command Update repair/reinstall failed. Cannot recover from exit code $($result.ExitCode)." "ERROR"
+                $global:HadVendorFailure = $true
+                return $result
+            }
         }
 
-        Write-Log "$displayName returned Dell service-related exit code $($result.ExitCode). Restarting Dell Client Management Service and retrying." "WARN"
-
-        [void](Restart-DellClientManagementService `
-            -ForceStop $DellClientManagementServiceForceStop `
-            -WaitTimeoutSeconds $DellClientManagementServiceWaitTimeoutSeconds `
-            -PostStartDelaySeconds $DellClientManagementServicePostStartDelaySeconds)
-
-        $attempt++
+        Write-Log "$displayName returned Dell service-related exit code $($result.ExitCode), but recovery/repair limits have been reached." "WARN"
+        $global:HadVendorFailure = $true
+        return $result
     }
-
-    return $result
 }
 
 # ============================================================
@@ -2058,6 +2346,8 @@ try {
     Write-Log "Dell tool bootstrapped: $global:DellToolBootstrapped"
     Write-Log "Dell apply ran: $global:DellApplyRan"
     Write-Log "Dell Client Management Service recovered/restarted: $global:DellClientManagementServiceRecovered"
+    Write-Log "Dell Command Update repair attempted: $global:DellCommandUpdateRepairAttempted"
+    Write-Log "Dell Command Update repair succeeded: $global:DellCommandUpdateRepairSucceeded"
 
     Write-Log "Lenovo tool found: $global:LenovoToolFound"
     Write-Log "Lenovo tool bootstrapped: $global:LenovoToolBootstrapped"
@@ -2099,6 +2389,8 @@ try {
     Write-Output "OEMUPDATER_DELL_TOOL_BOOTSTRAPPED=$global:DellToolBootstrapped"
     Write-Output "OEMUPDATER_DELL_APPLY_RAN=$global:DellApplyRan"
     Write-Output "OEMUPDATER_DELL_CLIENT_MANAGEMENT_SERVICE_RECOVERED=$global:DellClientManagementServiceRecovered"
+    Write-Output "OEMUPDATER_DELL_COMMAND_UPDATE_REPAIR_ATTEMPTED=$global:DellCommandUpdateRepairAttempted"
+    Write-Output "OEMUPDATER_DELL_COMMAND_UPDATE_REPAIR_SUCCEEDED=$global:DellCommandUpdateRepairSucceeded"
 
     Write-Output "OEMUPDATER_LENOVO_TOOL_FOUND=$global:LenovoToolFound"
     Write-Output "OEMUPDATER_LENOVO_TOOL_BOOTSTRAPPED=$global:LenovoToolBootstrapped"
