@@ -15,6 +15,7 @@ Notes:
 - HP BIOS/Firmware are excluded by default unless HPCategoryMode is set to All.
 - Dell, Lenovo, and HP tools can be downloaded/installed automatically if missing.
 - Lenovo history parsing is best-effort because Lenovo log/WMI output varies by System Update version.
+- Lenovo artifact discovery now inventories recent Lenovo-related files after TVSU runs.
 #>
 
 # ============================================================
@@ -32,6 +33,12 @@ $InstallHPImageAssistantIfMissing = $true
 
 $IncludeDellBiosFirmware = $false
 $IncludeLenovoRebootPackages = $false
+
+# Lenovo debug/history discovery settings
+$EnableLenovoDebugLogging = $true
+$LenovoArtifactLookbackMinutes = 15
+$LenovoArtifactInventoryMaxItems = 300
+$LenovoArtifactParseMaxDetailLines = 40
 
 # If true, Dell will retry /applyUpdates without -updateType if Dell rejects all filtered attempts with exit code 107.
 # Warning: unfiltered Dell apply may include BIOS/firmware updates. The script still uses -reboot=disable.
@@ -446,12 +453,134 @@ function Wait-ForProcessNames {
     $global:HadVendorWarning = $true
 }
 
+function Set-LenovoSystemUpdateSettings {
+    param(
+        [bool]$EnableDebug = $true
+    )
+
+    $generalPreferencePaths = @(
+        "HKLM:\SOFTWARE\Lenovo\System Update\Preferences\UserSettings\General",
+        "HKLM:\SOFTWARE\WOW6432Node\Lenovo\System Update\Preferences\UserSettings\General",
+        "HKLM:\SOFTWARE\Policies\Lenovo\System Update\UserSettings\General",
+        "HKLM:\SOFTWARE\WOW6432Node\Policies\Lenovo\System Update\UserSettings\General"
+    )
+
+    foreach ($prefPath in $generalPreferencePaths) {
+        try {
+            if (-not (Test-Path -LiteralPath $prefPath)) {
+                New-Item -Path $prefPath -Force | Out-Null
+            }
+
+            if ($EnableDebug) {
+                New-ItemProperty -Path $prefPath -Name "DebugEnable" -Value "YES" -PropertyType String -Force | Out-Null
+            }
+
+            New-ItemProperty -Path $prefPath -Name "MetricsEnabled" -Value "NO" -PropertyType String -Force | Out-Null
+            New-ItemProperty -Path $prefPath -Name "AskBeforeClosing" -Value "NO" -PropertyType String -Force | Out-Null
+            New-ItemProperty -Path $prefPath -Name "DisplayLicenseNotice" -Value "NO" -PropertyType String -Force | Out-Null
+            New-ItemProperty -Path $prefPath -Name "DisplayLicenseNoticeSU" -Value "NO" -PropertyType String -Force | Out-Null
+
+            Write-Log "Set Lenovo System Update preferences at $prefPath"
+        }
+        catch {
+            Write-Log "Could not set Lenovo System Update preference registry values at $prefPath`: $($_.Exception.Message)" "WARN"
+        }
+    }
+}
+
+function Get-RecentLenovoArtifacts {
+    param(
+        [Parameter(Mandatory = $true)]
+        [datetime]$RunStartTime,
+
+        [int]$LookbackMinutes = 15,
+
+        [int]$MaxItems = 300
+    )
+
+    $roots = New-Object System.Collections.Generic.List[string]
+
+    $candidateRoots = @(
+        "C:\ProgramData\Lenovo",
+        "C:\Program Files (x86)\Lenovo\System Update",
+        "C:\Program Files\Lenovo\System Update",
+        "C:\Windows\Temp",
+        "C:\Windows\SystemTemp"
+    )
+
+    foreach ($root in $candidateRoots) {
+        if ($root -and (Test-Path -LiteralPath $root)) {
+            [void]$roots.Add($root)
+        }
+    }
+
+    $recentFiles = @()
+    $cutoff = $RunStartTime.AddMinutes(-1 * [math]::Abs($LookbackMinutes))
+
+    foreach ($root in $roots) {
+        try {
+            $recentFiles += Get-ChildItem -Path $root -File -Recurse -ErrorAction SilentlyContinue |
+                Where-Object {
+                    $_.LastWriteTime -ge $cutoff -and
+                    (
+                        $_.FullName -match "(?i)lenovo|tvsu|system.update|systemupdate|applicability|update|trace|log" -or
+                        $root -match "(?i)\\Lenovo"
+                    )
+                }
+        }
+        catch {
+            Write-Log "Could not inventory Lenovo artifacts under $root`: $($_.Exception.Message)" "WARN"
+        }
+    }
+
+    $recentFiles = @($recentFiles |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -First $MaxItems)
+
+    return $recentFiles
+}
+
+function Write-LenovoArtifactInventory {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$Files
+    )
+
+    $inventoryFile = Join-Path $RunLogDir "Lenovo-Recent-Artifact-Inventory.txt"
+
+    try {
+        $lines = New-Object System.Collections.Generic.List[string]
+        [void]$lines.Add("Lenovo recent artifact inventory")
+        [void]$lines.Add("Generated: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")")
+        [void]$lines.Add("Count: $($Files.Count)")
+        [void]$lines.Add("")
+
+        foreach ($file in $Files) {
+            $length = $null
+            try {
+                $length = $file.Length
+            }
+            catch {}
+
+            [void]$lines.Add("$($file.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss")) | $length bytes | $($file.FullName)")
+        }
+
+        [System.IO.File]::WriteAllLines($inventoryFile, $lines.ToArray())
+        Write-Log "Lenovo artifact inventory saved to $inventoryFile"
+        return $inventoryFile
+    }
+    catch {
+        Write-Log "Could not write Lenovo artifact inventory: $($_.Exception.Message)" "WARN"
+        return $null
+    }
+}
+
 function Get-LenovoUpdateHistorySummary {
     param(
         [Parameter(Mandatory = $true)]
         [datetime]$RunStartTime,
 
-        [int]$MaxDetailLines = 25
+        [int]$MaxDetailLines = 40
     )
 
     $detailLines = New-Object System.Collections.Generic.List[string]
@@ -465,31 +594,21 @@ function Get-LenovoUpdateHistorySummary {
     $rebootMentionCount = 0
     $wmiItemsFound = 0
 
-    $logFolders = @(
-        "C:\ProgramData\Lenovo\System Update\logs",
-        "C:\ProgramData\Lenovo\SystemUpdate\logs",
-        "C:\ProgramData\Lenovo\SystemUpdate\session",
-        "C:\ProgramData\Lenovo\System Update"
-    )
+    $recentArtifacts = @(Get-RecentLenovoArtifacts `
+        -RunStartTime $RunStartTime `
+        -LookbackMinutes $LenovoArtifactLookbackMinutes `
+        -MaxItems $LenovoArtifactInventoryMaxItems)
 
-    $candidateLogs = @()
+    $inventoryFile = Write-LenovoArtifactInventory -Files $recentArtifacts
 
-    foreach ($folder in $logFolders) {
-        if (Test-Path -LiteralPath $folder) {
-            try {
-                $candidateLogs += Get-ChildItem -Path $folder -File -Recurse -ErrorAction SilentlyContinue |
-                    Where-Object {
-                        $_.LastWriteTime -ge $RunStartTime.AddMinutes(-5) -and
-                        $_.Extension -match "\.log|\.txt|\.xml"
-                    }
-            }
-            catch {}
-        }
-    }
+    $parseableArtifacts = @($recentArtifacts |
+        Where-Object {
+            $_.Extension -match "(?i)\.log|\.txt|\.xml|\.csv|\.dat" -and
+            $_.Length -gt 0 -and
+            $_.Length -lt 10485760
+        })
 
-    $candidateLogs = @($candidateLogs | Sort-Object LastWriteTime -Descending -Unique)
-
-    foreach ($logFile in $candidateLogs) {
+    foreach ($logFile in $parseableArtifacts) {
         [void]$logFilesReviewed.Add($logFile.FullName)
 
         try {
@@ -506,7 +625,7 @@ function Get-LenovoUpdateHistorySummary {
                 continue
             }
 
-            if ($cleanLine -match "\b[1-9][0-9]*\s+(package|packages|update|updates)\s+(were\s+)?installed\b") {
+            if ($cleanLine -match "(?i)\b[1-9][0-9]*\s+(package|packages|update|updates)\s+(were\s+)?installed\b") {
                 $installedCount++
 
                 if ($detailLines.Count -lt $MaxDetailLines) {
@@ -516,7 +635,7 @@ function Get-LenovoUpdateHistorySummary {
                 continue
             }
 
-            if ($cleanLine -match "\bsuccessfully installed\b") {
+            if ($cleanLine -match "(?i)\bsuccessfully installed\b") {
                 $installedCount++
 
                 if ($detailLines.Count -lt $MaxDetailLines) {
@@ -526,7 +645,7 @@ function Get-LenovoUpdateHistorySummary {
                 continue
             }
 
-            if ($cleanLine -match "\binstall(ed|ation)?\b.*\b(success|successful|completed)\b") {
+            if ($cleanLine -match "(?i)\binstall(ed|ation)?\b.*\b(success|successful|completed)\b") {
                 $installedCount++
 
                 if ($detailLines.Count -lt $MaxDetailLines) {
@@ -536,7 +655,7 @@ function Get-LenovoUpdateHistorySummary {
                 continue
             }
 
-            if ($cleanLine -match "\b(fail|failed|failure|error)\b") {
+            if ($cleanLine -match "(?i)\b(fail|failed|failure|error|exception)\b") {
                 $failedCount++
 
                 if ($detailLines.Count -lt $MaxDetailLines) {
@@ -546,7 +665,7 @@ function Get-LenovoUpdateHistorySummary {
                 continue
             }
 
-            if ($cleanLine -match "\b(skip|skipped|not selected|not installed)\b") {
+            if ($cleanLine -match "(?i)\b(skip|skipped|not selected|not installed)\b") {
                 $skippedCount++
 
                 if ($detailLines.Count -lt $MaxDetailLines) {
@@ -556,7 +675,7 @@ function Get-LenovoUpdateHistorySummary {
                 continue
             }
 
-            if ($cleanLine -match "\bnot applicable\b|\bno applicable\b|\bno updates\b|\bno packages\b|\bno package\b|\bno updates found\b") {
+            if ($cleanLine -match "(?i)\bnot applicable\b|\bno applicable\b|\bno updates\b|\bno packages\b|\bno package\b|\bno updates found\b|\bnothing to install\b") {
                 $notApplicableCount++
 
                 if ($detailLines.Count -lt $MaxDetailLines) {
@@ -566,7 +685,7 @@ function Get-LenovoUpdateHistorySummary {
                 continue
             }
 
-            if ($cleanLine -match "\breboot\b|\brestart\b") {
+            if ($cleanLine -match "(?i)\breboot\b|\brestart\b") {
                 $rebootMentionCount++
 
                 if ($detailLines.Count -lt $MaxDetailLines) {
@@ -634,6 +753,8 @@ function Get-LenovoUpdateHistorySummary {
         LogFilesReviewed = $logFilesReviewed
         WmiItemsFound = $wmiItemsFound
         WmiItems = $wmiItems
+        RecentArtifactsFound = $recentArtifacts.Count
+        InventoryFile = $inventoryFile
     }
 }
 
@@ -797,26 +918,7 @@ function Install-LenovoSystemUpdate {
     if ($lenovoInstallResult.Success) {
         Start-Sleep -Seconds 20
 
-        $lenovoPreferencePaths = @(
-            "HKLM:\SOFTWARE\Lenovo\System Update\Preferences\UserSettings\General",
-            "HKLM:\SOFTWARE\WOW6432Node\Lenovo\System Update\Preferences\UserSettings\General"
-        )
-
-        foreach ($prefPath in $lenovoPreferencePaths) {
-            try {
-                if (-not (Test-Path -LiteralPath $prefPath)) {
-                    New-Item -Path $prefPath -Force | Out-Null
-                }
-
-                New-ItemProperty -Path $prefPath -Name "MetricsEnabled" -Value "NO" -PropertyType String -Force | Out-Null
-                New-ItemProperty -Path $prefPath -Name "AskBeforeClosing" -Value "NO" -PropertyType String -Force | Out-Null
-                New-ItemProperty -Path $prefPath -Name "DisplayLicenseNotice" -Value "NO" -PropertyType String -Force | Out-Null
-                New-ItemProperty -Path $prefPath -Name "DisplayLicenseNoticeSU" -Value "NO" -PropertyType String -Force | Out-Null
-            }
-            catch {
-                Write-Log "Could not set Lenovo System Update preference registry values at $prefPath`: $($_.Exception.Message)" "WARN"
-            }
-        }
+        Set-LenovoSystemUpdateSettings -EnableDebug $EnableLenovoDebugLogging
 
         return $true
     }
@@ -1077,6 +1179,8 @@ try {
         $global:SupportedToolFound = $true
         $global:LenovoToolFound = $true
 
+        Set-LenovoSystemUpdateSettings -EnableDebug $EnableLenovoDebugLogging
+
         $lenovoArgs = @("/CM", "-search", $LenovoSearchMode, "-action", "INSTALL", "-noicon", "-nolicense", "-exporttowmi")
 
         if ($IncludeLenovoRebootPackages) {
@@ -1108,8 +1212,12 @@ try {
             -ProcessNames @("tvsu", "tvsukernel", "tvsucommandlauncher", "tvsuscheduler") `
             -TimeoutMinutes $LenovoPostProcessWaitMinutes
 
-        $lenovoHistory = Get-LenovoUpdateHistorySummary -RunStartTime $lenovoRunStart
+        $lenovoHistory = Get-LenovoUpdateHistorySummary `
+            -RunStartTime $lenovoRunStart `
+            -MaxDetailLines $LenovoArtifactParseMaxDetailLines
 
+        Write-Log "Lenovo recent artifacts found: $($lenovoHistory.RecentArtifactsFound)"
+        Write-Log "Lenovo artifact inventory file: $($lenovoHistory.InventoryFile)"
         Write-Log "Lenovo history logs reviewed: $($lenovoHistory.LogFilesReviewed.Count)"
         Write-Log "Lenovo WMI update items found: $($lenovoHistory.WmiItemsFound)"
         Write-Log "Lenovo parsed installed count: $($lenovoHistory.InstalledCount)"
@@ -1255,6 +1363,8 @@ try {
     Write-Log "HP apply ran: $global:HPApplyRan"
 
     if ($lenovoHistory) {
+        Write-Log "Lenovo summary recent artifacts found: $($lenovoHistory.RecentArtifactsFound)"
+        Write-Log "Lenovo summary artifact inventory file: $($lenovoHistory.InventoryFile)"
         Write-Log "Lenovo summary installed count: $($lenovoHistory.InstalledCount)"
         Write-Log "Lenovo summary failed count: $($lenovoHistory.FailedCount)"
         Write-Log "Lenovo summary skipped count: $($lenovoHistory.SkippedCount)"
@@ -1287,6 +1397,8 @@ try {
     Write-Output "OEMUPDATER_VENDOR_FAILURE=$global:HadVendorFailure"
 
     if ($lenovoHistory) {
+        Write-Output "OEMUPDATER_LENOVO_RECENT_ARTIFACTS_FOUND=$($lenovoHistory.RecentArtifactsFound)"
+        Write-Output "OEMUPDATER_LENOVO_ARTIFACT_INVENTORY=$($lenovoHistory.InventoryFile)"
         Write-Output "OEMUPDATER_LENOVO_HISTORY_LOGS_REVIEWED=$($lenovoHistory.LogFilesReviewed.Count)"
         Write-Output "OEMUPDATER_LENOVO_WMI_ITEMS_FOUND=$($lenovoHistory.WmiItemsFound)"
         Write-Output "OEMUPDATER_LENOVO_PARSED_INSTALLED=$($lenovoHistory.InstalledCount)"
@@ -1296,6 +1408,8 @@ try {
         Write-Output "OEMUPDATER_LENOVO_PARSED_REBOOT_MENTIONS=$($lenovoHistory.RebootMentionCount)"
     }
     else {
+        Write-Output "OEMUPDATER_LENOVO_RECENT_ARTIFACTS_FOUND=0"
+        Write-Output "OEMUPDATER_LENOVO_ARTIFACT_INVENTORY="
         Write-Output "OEMUPDATER_LENOVO_HISTORY_LOGS_REVIEWED=0"
         Write-Output "OEMUPDATER_LENOVO_WMI_ITEMS_FOUND=0"
         Write-Output "OEMUPDATER_LENOVO_PARSED_INSTALLED=0"
