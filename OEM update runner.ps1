@@ -70,7 +70,32 @@ $LenovoPostProcessWaitMinutes = 90
 $WhatIfOnly = $false
 $ReturnNonZeroOnVendorFailure = $false
 
-$DellCommandUpdateInstallerUrl = "https://dl.dell.com/FOLDER14424601M/1/Dell-Command-Update-Windows-Universal-Application_FGK9X_WIN64_5.7.0_A00.EXE"
+# Dell Command Update installer sources.
+# No private hosting required. The script tries Dell's driver details page, known Dell direct URLs,
+# then optional Chocolatey fallback for install-only scenarios.
+$DellCommandUpdateDriverId = "FGK9X"
+$DellCommandUpdateInstallerFileName = "Dell-Command-Update-Windows-Universal-Application_FGK9X_WIN64_5.7.0_A00.EXE"
+$DellCommandUpdateInstallerSha256 = "98C20D9809D7469A760B42A9A258E8C67A35C6CF46AA6A9C173E29D39A056D89"
+
+$DellCommandUpdateDriverDetailsUrls = @(
+    "https://www.dell.com/support/home/en-us/drivers/driversdetails?driverid=$DellCommandUpdateDriverId",
+    "https://www.dell.com/support/home/en-ca/drivers/driversdetails?driverid=$DellCommandUpdateDriverId"
+)
+
+$DellCommandUpdateKnownDirectUrls = @(
+    "https://dl.dell.com/FOLDER14424601M/1/$DellCommandUpdateInstallerFileName",
+    "https://downloads.dell.com/FOLDER14424601M/1/$DellCommandUpdateInstallerFileName"
+)
+
+# Optional local path. Leave blank unless you later decide to attach/cache the installer locally on endpoints.
+$DellCommandUpdateInstallerLocalPath = ""
+
+# Chocolatey fallback is useful when DCU is missing and Dell direct download is blocked.
+# For repair/reinstall, the script first pre-downloads an EXE before uninstalling existing DCU.
+# If Dell EXE download is blocked, Chocolatey repair fallback runs a forced choco upgrade/install WITHOUT uninstalling DCU first.
+$UseChocolateyFallbackForDellCommandUpdateInstall = $true
+$UseChocolateyFallbackForDellCommandUpdateRepair = $true
+$ChocolateyDellCommandUpdatePackageId = "dellcommandupdate"
 $DotNetDesktopRuntime8Url = "https://aka.ms/dotnet/8.0/windowsdesktop-runtime-win-x64.exe"
 
 $LenovoSystemUpdateInstallerUrl = "https://download.lenovo.com/pccbbs/thinkvantage_en/system_update_5.08.03.59.exe"
@@ -240,23 +265,76 @@ function Invoke-FileDownload {
         return $false
     }
 
+    $parent = Split-Path -Path $OutFile -Parent
+
+    if ($parent -and -not (Test-Path -LiteralPath $parent)) {
+        New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    }
+
     try {
         if (Test-Path -LiteralPath $OutFile) {
             Remove-Item -LiteralPath $OutFile -Force -ErrorAction SilentlyContinue
         }
 
-        Invoke-WebRequest -Uri $Uri -OutFile $OutFile -UseBasicParsing
-        return (Test-Path -LiteralPath $OutFile)
+        $headers = @{
+            "User-Agent" = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
+            "Accept" = "application/octet-stream,application/exe,application/vnd.microsoft.portable-executable,*/*"
+            "Accept-Language" = "en-US,en;q=0.9"
+            "Referer" = "https://www.dell.com/support/home/drivers/driversdetails"
+        }
+
+        Invoke-WebRequest `
+            -Uri $Uri `
+            -OutFile $OutFile `
+            -UseBasicParsing `
+            -Headers $headers `
+            -MaximumRedirection 10 `
+            -ErrorAction Stop
+
+        if ((Test-Path -LiteralPath $OutFile) -and ((Get-Item -LiteralPath $OutFile).Length -gt 0)) {
+            return $true
+        }
     }
     catch {
         Write-Log "Invoke-WebRequest failed: $($_.Exception.Message)" "WARN"
     }
 
     try {
+        if (Get-Command Start-BitsTransfer -ErrorAction SilentlyContinue) {
+            if (Test-Path -LiteralPath $OutFile) {
+                Remove-Item -LiteralPath $OutFile -Force -ErrorAction SilentlyContinue
+            }
+
+            Start-BitsTransfer `
+                -Source $Uri `
+                -Destination $OutFile `
+                -ErrorAction Stop
+
+            if ((Test-Path -LiteralPath $OutFile) -and ((Get-Item -LiteralPath $OutFile).Length -gt 0)) {
+                return $true
+            }
+        }
+    }
+    catch {
+        Write-Log "BITS download failed: $($_.Exception.Message)" "WARN"
+    }
+
+    try {
+        if (Test-Path -LiteralPath $OutFile) {
+            Remove-Item -LiteralPath $OutFile -Force -ErrorAction SilentlyContinue
+        }
+
         $webClient = New-Object System.Net.WebClient
+        $webClient.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+        $webClient.Headers.Add("Referer", "https://www.dell.com/support/home/drivers/driversdetails")
         $webClient.DownloadFile($Uri, $OutFile)
         $webClient.Dispose()
-        return (Test-Path -LiteralPath $OutFile)
+
+        if ((Test-Path -LiteralPath $OutFile) -and ((Get-Item -LiteralPath $OutFile).Length -gt 0)) {
+            return $true
+        }
+
+        return $false
     }
     catch {
         Write-Log "WebClient download failed: $($_.Exception.Message)" "ERROR"
@@ -910,6 +988,33 @@ function Repair-DellCommandUpdate {
 
     New-Item -ItemType Directory -Path $DownloadFolder -Force | Out-Null
 
+    Write-Log "Pre-downloading Dell Command Update installer before uninstalling existing DCU. Existing DCU will not be removed unless the replacement installer is cached locally first."
+    $preDownloadedDcuInstaller = Get-DellCommandUpdateInstallerFile -DownloadFolder $DownloadFolder
+
+    if (-not $preDownloadedDcuInstaller -or -not (Test-Path -LiteralPath $preDownloadedDcuInstaller)) {
+        Write-Log "Dell Command Update replacement EXE could not be downloaded from Dell sources. Existing DCU will not be uninstalled." "WARN"
+
+        if ($UseChocolateyFallbackForDellCommandUpdateRepair) {
+            Write-Log "Trying Chocolatey fallback repair without uninstalling existing Dell Command Update." "WARN"
+
+            $chocoRepairSucceeded = Install-DellCommandUpdateWithChocolatey -Force
+
+            if ($chocoRepairSucceeded) {
+                [void](Restart-DellClientManagementService `
+                    -ForceStop $DellClientManagementServiceForceStop `
+                    -WaitTimeoutSeconds $DellClientManagementServiceWaitTimeoutSeconds `
+                    -PostStartDelaySeconds $DellClientManagementServicePostStartDelaySeconds)
+
+                $global:DellCommandUpdateRepairSucceeded = $true
+                return $true
+            }
+        }
+
+        Write-Log "Dell Command Update repair aborted because no replacement EXE was cached and Chocolatey repair fallback did not succeed. Existing DCU was not uninstalled." "ERROR"
+        $global:DellCommandUpdateRepairSucceeded = $false
+        return $false
+    }
+
     $svcName = Get-DellClientManagementServiceName
 
     if ($svcName) {
@@ -930,10 +1035,13 @@ function Repair-DellCommandUpdate {
     $uninstallSucceeded = Uninstall-DellCommandUpdate -TimeoutMinutes $DellCommandUpdateUninstallTimeoutMinutes
 
     if (-not $uninstallSucceeded) {
-        Write-Log "Dell Command Update uninstall had warnings or failures. Continuing with reinstall attempt." "WARN"
+        Write-Log "Dell Command Update uninstall had warnings or failures. Continuing with reinstall attempt because replacement installer is already cached." "WARN"
     }
 
-    $installed = Install-DellCommandUpdate -DownloadFolder $DownloadFolder
+    $installed = Install-DellCommandUpdate `
+        -DownloadFolder $DownloadFolder `
+        -PreDownloadedInstallerPath $preDownloadedDcuInstaller `
+        -AllowChocolateyFallback $false
 
     if (-not $installed) {
         Write-Log "Dell Command Update repair failed because reinstall did not complete successfully." "ERROR"
@@ -1846,10 +1954,312 @@ function Install-DotNetDesktopRuntime8 {
     return $false
 }
 
-function Install-DellCommandUpdate {
+function Get-FileSha256String {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    try {
+        if (Test-Path -LiteralPath $Path) {
+            return (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash.ToUpperInvariant()
+        }
+    }
+    catch {
+        Write-Log "Could not calculate SHA256 for $Path`: $($_.Exception.Message)" "WARN"
+    }
+
+    return ""
+}
+
+function Test-DellCommandUpdateInstallerHash {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    if ([string]::IsNullOrWhiteSpace($DellCommandUpdateInstallerSha256)) {
+        return $true
+    }
+
+    $actualHash = Get-FileSha256String -Path $Path
+
+    if (-not $actualHash) {
+        return $false
+    }
+
+    if ($actualHash -eq $DellCommandUpdateInstallerSha256.ToUpperInvariant()) {
+        Write-Log "Dell Command Update installer SHA256 verified: $actualHash"
+        return $true
+    }
+
+    Write-Log "Dell Command Update installer SHA256 mismatch. Expected=$DellCommandUpdateInstallerSha256 Actual=$actualHash" "WARN"
+    return $false
+}
+
+function Get-DellDriverDetailsPageHtml {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Url
+    )
+
+    try {
+        Write-Log "Reading Dell driver details page: $Url"
+
+        $headers = @{
+            "User-Agent" = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
+            "Accept" = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+            "Accept-Language" = "en-US,en;q=0.9"
+        }
+
+        $response = Invoke-WebRequest `
+            -Uri $Url `
+            -UseBasicParsing `
+            -Headers $headers `
+            -MaximumRedirection 10 `
+            -ErrorAction Stop
+
+        if ($response -and $response.Content) {
+            return [string]$response.Content
+        }
+    }
+    catch {
+        Write-Log "Could not read Dell driver details page $Url`: $($_.Exception.Message)" "WARN"
+    }
+
+    try {
+        $webClient = New-Object System.Net.WebClient
+        $webClient.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+        $html = $webClient.DownloadString($Url)
+        $webClient.Dispose()
+
+        if ($html) {
+            return [string]$html
+        }
+    }
+    catch {
+        Write-Log "WebClient could not read Dell driver details page $Url`: $($_.Exception.Message)" "WARN"
+    }
+
+    return ""
+}
+
+function Get-DellCommandUpdateInstallerCandidateUrls {
+    $candidateUrls = [System.Collections.ArrayList]::new()
+
+    foreach ($detailsUrl in $DellCommandUpdateDriverDetailsUrls) {
+        $html = Get-DellDriverDetailsPageHtml -Url $detailsUrl
+
+        if (-not $html) {
+            continue
+        }
+
+        $decodedHtml = $html
+
+        try {
+            $decodedHtml = [System.Net.WebUtility]::HtmlDecode($decodedHtml)
+        }
+        catch {}
+
+        $decodedHtml = $decodedHtml -replace '\u002f', '/'
+        $decodedHtml = $decodedHtml -replace '\/', '/'
+
+        $patterns = @(
+            'https?://(?:dl|downloads)\.dell\.com/[^"''<>\s]+\.EXE',
+            'https?://(?:dl|downloads)\.dell\.com/[^"''<>\s]+\.exe',
+            '/FOLDER[0-9A-Za-z_/.-]+\.EXE',
+            '/FOLDER[0-9A-Za-z_/.-]+\.exe'
+        )
+
+        foreach ($pattern in $patterns) {
+            $matches = [regex]::Matches($decodedHtml, $pattern)
+
+            foreach ($match in $matches) {
+                $url = [string]$match.Value
+
+                if ($url -notmatch '^https?://') {
+                    $url = "https://dl.dell.com" + $url
+                }
+
+                if ($url -match [regex]::Escape($DellCommandUpdateInstallerFileName)) {
+                    if (-not ($candidateUrls -contains $url)) {
+                        [void]$candidateUrls.Add($url)
+                    }
+                }
+            }
+        }
+    }
+
+    foreach ($url in $DellCommandUpdateKnownDirectUrls) {
+        if (-not ($candidateUrls -contains $url)) {
+            [void]$candidateUrls.Add($url)
+        }
+    }
+
+    return @($candidateUrls)
+}
+
+function Get-DellCommandUpdateInstallerFile {
     param(
         [Parameter(Mandatory = $true)]
         [string]$DownloadFolder
+    )
+
+    New-Item -ItemType Directory -Path $DownloadFolder -Force | Out-Null
+
+    $installerPath = Join-Path $DownloadFolder "Dell-Command-Update-Installer.exe"
+
+    if (-not [string]::IsNullOrWhiteSpace($DellCommandUpdateInstallerLocalPath)) {
+        if (Test-Path -LiteralPath $DellCommandUpdateInstallerLocalPath) {
+            Write-Log "Using local Dell Command Update installer: $DellCommandUpdateInstallerLocalPath"
+            Copy-Item -LiteralPath $DellCommandUpdateInstallerLocalPath -Destination $installerPath -Force
+
+            if ((Test-Path -LiteralPath $installerPath) -and ((Get-Item -LiteralPath $installerPath).Length -gt 0)) {
+                if (Test-DellCommandUpdateInstallerHash -Path $installerPath) {
+                    return $installerPath
+                }
+
+                Remove-Item -LiteralPath $installerPath -Force -ErrorAction SilentlyContinue
+            }
+        }
+        else {
+            Write-Log "Configured DellCommandUpdateInstallerLocalPath does not exist: $DellCommandUpdateInstallerLocalPath" "WARN"
+        }
+    }
+
+    $candidateUrls = @(Get-DellCommandUpdateInstallerCandidateUrls)
+
+    if ($candidateUrls.Count -eq 0) {
+        Write-Log "No Dell Command Update installer candidate URLs were found." "WARN"
+    }
+
+    foreach ($url in $candidateUrls) {
+        Write-Log "Trying Dell Command Update installer source: $url"
+
+        $downloaded = Invoke-FileDownload -Uri $url -OutFile $installerPath
+
+        if ($downloaded -and (Test-Path -LiteralPath $installerPath) -and ((Get-Item -LiteralPath $installerPath).Length -gt 0)) {
+            if (Test-DellCommandUpdateInstallerHash -Path $installerPath) {
+                Write-Log "Dell Command Update installer downloaded successfully from: $url"
+                return $installerPath
+            }
+
+            Write-Log "Downloaded Dell Command Update installer failed hash validation. Deleting file and trying next source." "WARN"
+            Remove-Item -LiteralPath $installerPath -Force -ErrorAction SilentlyContinue
+        }
+
+        Write-Log "Dell Command Update installer source failed: $url" "WARN"
+    }
+
+    Write-Log "Unable to obtain Dell Command Update installer from Dell sources." "ERROR"
+    return $null
+}
+
+function Find-ChocolateyExecutable {
+    $choco = Get-Command choco.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+
+    if ($choco -and $choco.Source) {
+        return $choco.Source
+    }
+
+    $candidatePaths = @(
+        "C:\ProgramData\chocolatey\bin\choco.exe",
+        "C:\ProgramData\Chocolatey\bin\choco.exe"
+    )
+
+    foreach ($candidatePath in $candidatePaths) {
+        if (Test-Path -LiteralPath $candidatePath) {
+            return $candidatePath
+        }
+    }
+
+    return $null
+}
+
+function Install-DellCommandUpdateWithChocolatey {
+    param(
+        [string]$PackageId = $ChocolateyDellCommandUpdatePackageId,
+
+        [switch]$Force
+    )
+
+    $isRepairMode = [bool]$Force
+
+    if ($isRepairMode) {
+        if (-not $UseChocolateyFallbackForDellCommandUpdateRepair) {
+            Write-Log "Chocolatey fallback for Dell Command Update repair is disabled."
+            return $false
+        }
+    }
+    else {
+        if (-not $UseChocolateyFallbackForDellCommandUpdateInstall) {
+            Write-Log "Chocolatey fallback for Dell Command Update install is disabled."
+            return $false
+        }
+    }
+
+    $choco = Find-ChocolateyExecutable
+
+    if (-not $choco) {
+        Write-Log "choco.exe was not found. Cannot use Chocolatey fallback for Dell Command Update." "WARN"
+        return $false
+    }
+
+    if ([string]::IsNullOrWhiteSpace($PackageId)) {
+        Write-Log "Chocolatey Dell Command Update package id is blank. Cannot use Chocolatey fallback." "WARN"
+        return $false
+    }
+
+    $args = @(
+        "upgrade",
+        $PackageId,
+        "-y",
+        "--no-progress",
+        "--execution-timeout=7200"
+    )
+
+    if ($Force) {
+        $args += "--force"
+        Write-Log "Trying Chocolatey fallback for Dell Command Update repair using package id: $PackageId"
+        Write-Log "Chocolatey repair fallback will run a forced upgrade/install without uninstalling existing DCU first."
+    }
+    else {
+        Write-Log "Trying Chocolatey fallback for Dell Command Update install using package id: $PackageId"
+    }
+
+    $chocoResult = Invoke-LoggedProcess `
+        -Name "Dell Command Update Chocolatey Install" `
+        -FilePath $choco `
+        -Arguments $args `
+        -SuccessExitCodes @(0) `
+        -RebootExitCodes @(3010, 1641)
+
+    if ($chocoResult.Success) {
+        Start-Sleep -Seconds 20
+
+        $cli = Find-DellCommandUpdateCli
+
+        if ($cli) {
+            Write-Log "Dell Command Update installed or repaired by Chocolatey fallback. CLI path: $cli"
+            return $true
+        }
+
+        Write-Log "Chocolatey reported success, but dcu-cli.exe was not found." "WARN"
+        return $false
+    }
+
+    Write-Log "Chocolatey fallback did not install or repair Dell Command Update successfully." "WARN"
+    return $false
+}
+
+function Install-DellCommandUpdate {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DownloadFolder,
+
+        [string]$PreDownloadedInstallerPath = "",
+
+        [bool]$AllowChocolateyFallback = $true
     )
 
     $dotNetReady = Install-DotNetDesktopRuntime8 -DownloadFolder $DownloadFolder
@@ -1859,31 +2269,43 @@ function Install-DellCommandUpdate {
         return $false
     }
 
-    $dcuInstaller = Join-Path $DownloadFolder "Dell-Command-Update-Installer.exe"
-    $dcuInstallLog = Join-Path $DownloadFolder "Dell-Command-Update-Install.log"
-
-    $downloaded = Invoke-FileDownload -Uri $DellCommandUpdateInstallerUrl -OutFile $dcuInstaller
-
-    if (-not $downloaded) {
-        Write-Log "Failed to download Dell Command Update installer." "ERROR"
-        $global:HadVendorFailure = $true
-        return $false
+    if (-not [string]::IsNullOrWhiteSpace($PreDownloadedInstallerPath) -and (Test-Path -LiteralPath $PreDownloadedInstallerPath)) {
+        $dcuInstaller = $PreDownloadedInstallerPath
+        Write-Log "Using pre-downloaded Dell Command Update installer: $dcuInstaller"
+    }
+    else {
+        $dcuInstaller = Get-DellCommandUpdateInstallerFile -DownloadFolder $DownloadFolder
     }
 
-    Write-Log "Installing Dell Command Update silently."
+    if ($dcuInstaller -and (Test-Path -LiteralPath $dcuInstaller)) {
+        $dcuInstallLog = Join-Path $DownloadFolder "Dell-Command-Update-Install.log"
 
-    $dcuInstallResult = Invoke-LoggedProcess `
-        -Name "Dell Command Update Installer" `
-        -FilePath $dcuInstaller `
-        -Arguments @("/s", "/l=$dcuInstallLog") `
-        -SuccessExitCodes @(0) `
-        -RebootExitCodes @(2, 3010)
+        Write-Log "Installing Dell Command Update silently."
 
-    if ($dcuInstallResult.Success) {
-        Start-Sleep -Seconds 20
-        return $true
+        $dcuInstallResult = Invoke-LoggedProcess `
+            -Name "Dell Command Update Installer" `
+            -FilePath $dcuInstaller `
+            -Arguments @("/s", "/l=$dcuInstallLog") `
+            -SuccessExitCodes @(0) `
+            -RebootExitCodes @(2, 3010)
+
+        if ($dcuInstallResult.Success) {
+            Start-Sleep -Seconds 20
+            return $true
+        }
+
+        Write-Log "Dell Command Update installer ran but did not report success." "WARN"
+    }
+    else {
+        Write-Log "Dell Command Update installer could not be downloaded from Dell sources." "WARN"
     }
 
+    if ($AllowChocolateyFallback) {
+        return (Install-DellCommandUpdateWithChocolatey)
+    }
+
+    Write-Log "Dell Command Update install cannot continue without a downloaded installer." "ERROR"
+    $global:HadVendorFailure = $true
     return $false
 }
 
