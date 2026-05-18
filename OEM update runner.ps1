@@ -15,7 +15,7 @@ Notes:
 - HP BIOS/Firmware are excluded by default unless HPCategoryMode is set to All.
 - Dell, Lenovo, and HP tools can be downloaded/installed automatically if missing.
 - Lenovo history parsing is best-effort because Lenovo log/WMI output varies by System Update version.
-- Lenovo artifact discovery now inventories recent Lenovo-related files after TVSU runs.
+- Lenovo artifact discovery inventories recent Lenovo-related files after TVSU runs.
 #>
 
 # ============================================================
@@ -575,6 +575,53 @@ function Write-LenovoArtifactInventory {
     }
 }
 
+function Test-LenovoParserNoiseLine {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Line
+    )
+
+    if ($Line -match "^(?i)(none|null|true|false|fffe|ffff|0x[0-9a-f]+|\d+)$") {
+        return $true
+    }
+
+    if ($Line -match "^(?i)Microsoft Hardware Error Device Driver$") {
+        return $true
+    }
+
+    if ($Line -match "^(?i)Windows Error Reporting Service$") {
+        return $true
+    }
+
+    if ($Line -match "^(?i)Windows Error Reporting$") {
+        return $true
+    }
+
+    return $false
+}
+
+function Add-LenovoParsedDetail {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.Generic.List[string]]$DetailList,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Type,
+
+        [Parameter(Mandatory = $true)]
+        [string]$SourceFile,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Line,
+
+        [int]$MaxDetailLines = 40
+    )
+
+    if ($DetailList.Count -lt $MaxDetailLines) {
+        [void]$DetailList.Add("$Type`: [$SourceFile] $Line")
+    }
+}
+
 function Get-LenovoUpdateHistorySummary {
     param(
         [Parameter(Mandatory = $true)]
@@ -625,73 +672,54 @@ function Get-LenovoUpdateHistorySummary {
                 continue
             }
 
-            if ($cleanLine -match "(?i)\b[1-9][0-9]*\s+(package|packages|update|updates)\s+(were\s+)?installed\b") {
+            if (Test-LenovoParserNoiseLine -Line $cleanLine) {
+                continue
+            }
+
+            $hasStrongLenovoContext = $cleanLine -match "(?i)\b(lenovo|tvsu|system update|thin installer|thininstaller|applicability|package|packages|update|updates|install|installed|installation|download|extract|repository|severity|result|return code|exit code|reboot type)\b"
+            $hasFailureWord = $cleanLine -match "(?i)\b(failed|failure|fail)\b"
+            $hasErrorWord = $cleanLine -match "(?i)\b(error|exception)\b"
+            $hasInstallSuccess = $cleanLine -match "(?i)\b(successfully installed|install(ed|ation)?\b.*\b(success|successful|completed)|[1-9][0-9]*\s+(package|packages|update|updates)\s+(were\s+)?installed)\b"
+            $hasSkipped = $cleanLine -match "(?i)\b(skip|skipped|not selected|not installed)\b"
+            $hasNoUpdates = $cleanLine -match "(?i)\bnot applicable\b|\bno applicable\b|\bno updates\b|\bno packages\b|\bno package\b|\bno updates found\b|\bnothing to install\b"
+            $hasReboot = $cleanLine -match "(?i)\breboot\b|\brestart\b"
+            $hasBadReturnCode = $cleanLine -match "(?i)\b(return code|exit code|result code)\b\s*[:=]?\s*(1|[2-9][0-9]*)\b"
+
+            if ($hasInstallSuccess -and $hasStrongLenovoContext) {
                 $installedCount++
-
-                if ($detailLines.Count -lt $MaxDetailLines) {
-                    [void]$detailLines.Add("INSTALLED: $cleanLine")
-                }
-
+                Add-LenovoParsedDetail -DetailList $detailLines -Type "INSTALLED" -SourceFile $logFile.FullName -Line $cleanLine -MaxDetailLines $MaxDetailLines
                 continue
             }
 
-            if ($cleanLine -match "(?i)\bsuccessfully installed\b") {
-                $installedCount++
-
-                if ($detailLines.Count -lt $MaxDetailLines) {
-                    [void]$detailLines.Add("INSTALLED: $cleanLine")
-                }
-
-                continue
-            }
-
-            if ($cleanLine -match "(?i)\binstall(ed|ation)?\b.*\b(success|successful|completed)\b") {
-                $installedCount++
-
-                if ($detailLines.Count -lt $MaxDetailLines) {
-                    [void]$detailLines.Add("INSTALLED: $cleanLine")
-                }
-
-                continue
-            }
-
-            if ($cleanLine -match "(?i)\b(fail|failed|failure|error|exception)\b") {
-                $failedCount++
-
-                if ($detailLines.Count -lt $MaxDetailLines) {
-                    [void]$detailLines.Add("FAILED: $cleanLine")
-                }
-
-                continue
-            }
-
-            if ($cleanLine -match "(?i)\b(skip|skipped|not selected|not installed)\b") {
-                $skippedCount++
-
-                if ($detailLines.Count -lt $MaxDetailLines) {
-                    [void]$detailLines.Add("SKIPPED: $cleanLine")
-                }
-
-                continue
-            }
-
-            if ($cleanLine -match "(?i)\bnot applicable\b|\bno applicable\b|\bno updates\b|\bno packages\b|\bno package\b|\bno updates found\b|\bnothing to install\b") {
+            if ($hasNoUpdates -and $hasStrongLenovoContext) {
                 $notApplicableCount++
-
-                if ($detailLines.Count -lt $MaxDetailLines) {
-                    [void]$detailLines.Add("NOT_APPLICABLE: $cleanLine")
-                }
-
+                Add-LenovoParsedDetail -DetailList $detailLines -Type "NOT_APPLICABLE" -SourceFile $logFile.FullName -Line $cleanLine -MaxDetailLines $MaxDetailLines
                 continue
             }
 
-            if ($cleanLine -match "(?i)\breboot\b|\brestart\b") {
+            if ($hasSkipped -and $hasStrongLenovoContext) {
+                $skippedCount++
+                Add-LenovoParsedDetail -DetailList $detailLines -Type "SKIPPED" -SourceFile $logFile.FullName -Line $cleanLine -MaxDetailLines $MaxDetailLines
+                continue
+            }
+
+            if ($hasReboot -and $hasStrongLenovoContext) {
                 $rebootMentionCount++
+                Add-LenovoParsedDetail -DetailList $detailLines -Type "REBOOT" -SourceFile $logFile.FullName -Line $cleanLine -MaxDetailLines $MaxDetailLines
+                continue
+            }
 
-                if ($detailLines.Count -lt $MaxDetailLines) {
-                    [void]$detailLines.Add("REBOOT: $cleanLine")
-                }
+            # Failure parsing is intentionally stricter to avoid false positives like:
+            # "Microsoft Hardware Error Device Driver" or "Windows Error Reporting Service".
+            if ($hasStrongLenovoContext -and ($hasFailureWord -or $hasBadReturnCode)) {
+                $failedCount++
+                Add-LenovoParsedDetail -DetailList $detailLines -Type "FAILED" -SourceFile $logFile.FullName -Line $cleanLine -MaxDetailLines $MaxDetailLines
+                continue
+            }
 
+            if ($hasStrongLenovoContext -and $hasErrorWord -and ($cleanLine -match "(?i)\b(lenovo|tvsu|system update|package|update|install|download|extract|applicability|repository|return code|exit code|result code)\b")) {
+                $failedCount++
+                Add-LenovoParsedDetail -DetailList $detailLines -Type "FAILED" -SourceFile $logFile.FullName -Line $cleanLine -MaxDetailLines $MaxDetailLines
                 continue
             }
         }
@@ -1236,7 +1264,7 @@ try {
 
         if ($lenovoHistory.FailedCount -gt 0) {
             $global:HadVendorWarning = $true
-            Write-Log "Lenovo history parser found failure/error lines. Review Lenovo detail lines and TVSU logs." "WARN"
+            Write-Log "Lenovo history parser found likely Lenovo update failure lines. Review Lenovo detail lines and TVSU logs." "WARN"
         }
 
         if ($lenovoHistory.RebootMentionCount -gt 0) {
