@@ -36,9 +36,14 @@ $IncludeBiosFirmwareUpdates = $false
 # "3" is the safest no-auto-reboot setting. Avoid "1,3,4" unless you accept higher vendor reboot/shutdown risk.
 $LenovoRebootPackageTypes = "3"
 
-# Backward-compatible knobs
-$IncludeDellBiosFirmware = $IncludeBiosFirmwareUpdates
-$IncludeLenovoRebootPackages = $InstallRebootRequiredUpdatesNoAutoReboot
+# Dell service recovery
+$RestartDellClientManagementServiceBeforeDellApply = $true
+$RestartDellClientManagementServiceOnServiceError = $true
+$DellClientManagementServiceForceStop = $true
+$DellClientManagementServiceWaitTimeoutSeconds = 90
+$DellClientManagementServicePostStartDelaySeconds = 20
+$DellDcuServiceRecoveryExitCodes = @(3000, 3002, 3003, 3004, 3005)
+$DellDcuServiceRecoveryRetries = 1
 
 $EnableLenovoDebugLogging = $true
 $LenovoArtifactLookbackMinutes = 15
@@ -93,11 +98,13 @@ $global:SupportedToolFound = $false
 $global:DellToolFound = $false
 $global:DellApplyRan = $false
 $global:DellToolBootstrapped = $false
+$global:DellClientManagementServiceRecovered = $false
 
 $global:LenovoToolFound = $false
 $global:LenovoApplyRan = $false
 $global:LenovoToolBootstrapped = $false
 $global:LenovoLikelyNoApplicableUpdates = $false
+$global:LenovoRebootMetadataFound = $false
 
 $global:HPToolFound = $false
 $global:HPApplyRan = $false
@@ -277,7 +284,9 @@ function Invoke-LoggedProcess {
 
         [int[]]$RebootExitCodes = @(),
 
-        [int[]]$WarningExitCodes = @()
+        [int[]]$WarningExitCodes = @(),
+
+        [int[]]$NonFatalUnexpectedExitCodes = @()
     )
 
     $safeName = $Name -replace "[^\w.-]", "_"
@@ -371,6 +380,7 @@ function Invoke-LoggedProcess {
         $isSuccessCode = $SuccessExitCodes -contains $exitCode
         $isRebootCode = $RebootExitCodes -contains $exitCode
         $isWarningCode = $WarningExitCodes -contains $exitCode
+        $isNonFatalUnexpectedCode = $NonFatalUnexpectedExitCodes -contains $exitCode
 
         $status = "Failure"
 
@@ -393,8 +403,13 @@ function Invoke-LoggedProcess {
         $success = $isSuccessCode -or $isRebootCode -or $isWarningCode
 
         if (-not $success) {
-            $global:HadVendorFailure = $true
-            Write-Log "$Name returned an unexpected or non-success exit code: $exitCode" "WARN"
+            if ($isNonFatalUnexpectedCode) {
+                Write-Log "$Name returned recoverable/non-fatal unexpected exit code: $exitCode" "WARN"
+            }
+            else {
+                $global:HadVendorFailure = $true
+                Write-Log "$Name returned an unexpected or non-success exit code: $exitCode" "WARN"
+            }
         }
 
         return [pscustomobject]@{
@@ -474,6 +489,262 @@ function Wait-ForProcessNames {
     Write-Log "Timed out waiting for $Label child/background processes after $TimeoutMinutes minutes." "WARN"
     $global:HadVendorWarning = $true
 }
+
+# ============================================================
+# Dell service recovery helpers
+# ============================================================
+
+function Get-DellClientManagementServiceName {
+    $candidateNames = @(
+        "DellClientManagementService",
+        "DellClientManagement",
+        "DellUpdateService"
+    )
+
+    foreach ($candidateName in $candidateNames) {
+        $svc = Get-Service -Name $candidateName -ErrorAction SilentlyContinue
+
+        if ($svc) {
+            return $svc.Name
+        }
+    }
+
+    $svcByDisplayName = Get-Service -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.DisplayName -eq "Dell Client Management Service" -or
+            $_.DisplayName -match "(?i)^Dell.*Client.*Management.*Service$"
+        } |
+        Select-Object -First 1
+
+    if ($svcByDisplayName) {
+        return $svcByDisplayName.Name
+    }
+
+    try {
+        $cimSvc = Get-CimInstance -ClassName Win32_Service -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.DisplayName -eq "Dell Client Management Service" -or
+                $_.DisplayName -match "(?i)^Dell.*Client.*Management.*Service$"
+            } |
+            Select-Object -First 1
+
+        if ($cimSvc) {
+            return $cimSvc.Name
+        }
+    }
+    catch {}
+
+    return $null
+}
+
+function Wait-ServiceStatus {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ServiceName,
+
+        [Parameter(Mandatory = $true)]
+        [string]$DesiredStatus,
+
+        [int]$TimeoutSeconds = 90
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+
+    while ((Get-Date) -lt $deadline) {
+        $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+
+        if ($svc -and $svc.Status.ToString() -eq $DesiredStatus) {
+            return $true
+        }
+
+        Start-Sleep -Seconds 2
+    }
+
+    return $false
+}
+
+function Restart-DellClientManagementService {
+    param(
+        [bool]$ForceStop = $true,
+
+        [int]$WaitTimeoutSeconds = 90,
+
+        [int]$PostStartDelaySeconds = 20
+    )
+
+    $svcName = Get-DellClientManagementServiceName
+
+    if (-not $svcName) {
+        Write-Log "Dell Client Management Service was not found. Dell Command Update may need repair/reinstall." "WARN"
+        return $false
+    }
+
+    Write-Log "Dell Client Management Service detected as service name: $svcName"
+
+    try {
+        $cimSvc = Get-CimInstance -ClassName Win32_Service -Filter "Name='$svcName'" -ErrorAction SilentlyContinue
+
+        if ($cimSvc -and $cimSvc.StartMode -eq "Disabled") {
+            Write-Log "Dell Client Management Service is disabled. Setting startup type to Automatic." "WARN"
+
+            try {
+                Set-Service -Name $svcName -StartupType Automatic -ErrorAction Stop
+            }
+            catch {
+                Write-Log "Set-Service failed for Dell Client Management Service startup type. Trying sc.exe config. Error: $($_.Exception.Message)" "WARN"
+                & sc.exe config $svcName start= auto | Out-Null
+            }
+        }
+    }
+    catch {
+        Write-Log "Could not inspect Dell Client Management Service startup mode: $($_.Exception.Message)" "WARN"
+    }
+
+    try {
+        $svc = Get-Service -Name $svcName -ErrorAction Stop
+
+        if ($svc.Status -ne "Stopped") {
+            Write-Log "Stopping Dell Client Management Service. ForceStop=$ForceStop"
+
+            if ($ForceStop) {
+                Stop-Service -Name $svcName -Force -ErrorAction Stop
+            }
+            else {
+                Stop-Service -Name $svcName -ErrorAction Stop
+            }
+
+            $stopped = Wait-ServiceStatus `
+                -ServiceName $svcName `
+                -DesiredStatus "Stopped" `
+                -TimeoutSeconds $WaitTimeoutSeconds
+
+            if (-not $stopped) {
+                Write-Log "Dell Client Management Service did not stop within $WaitTimeoutSeconds seconds." "WARN"
+                return $false
+            }
+        }
+        else {
+            Write-Log "Dell Client Management Service is already stopped."
+        }
+    }
+    catch {
+        Write-Log "Could not stop Dell Client Management Service: $($_.Exception.Message)" "WARN"
+        return $false
+    }
+
+    try {
+        Write-Log "Starting Dell Client Management Service."
+        Start-Service -Name $svcName -ErrorAction Stop
+
+        $running = Wait-ServiceStatus `
+            -ServiceName $svcName `
+            -DesiredStatus "Running" `
+            -TimeoutSeconds $WaitTimeoutSeconds
+
+        if (-not $running) {
+            Write-Log "Dell Client Management Service did not reach Running state within $WaitTimeoutSeconds seconds." "WARN"
+            return $false
+        }
+
+        if ($PostStartDelaySeconds -gt 0) {
+            Write-Log "Waiting $PostStartDelaySeconds seconds after Dell Client Management Service start."
+            Start-Sleep -Seconds $PostStartDelaySeconds
+        }
+
+        $global:DellClientManagementServiceRecovered = $true
+        Write-Log "Dell Client Management Service restart completed."
+        return $true
+    }
+    catch {
+        Write-Log "Could not start Dell Client Management Service: $($_.Exception.Message)" "WARN"
+        return $false
+    }
+}
+
+function Invoke-DellCommandUpdateApplyWithServiceRecovery {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DellCli,
+
+        [string]$UpdateType,
+
+        [Parameter(Mandatory = $true)]
+        [string]$OutputLog,
+
+        [switch]$Unfiltered
+    )
+
+    if ($Unfiltered) {
+        $displayName = "Dell Command Update Apply Unfiltered"
+        $arguments = @("/applyUpdates", "-silent", "-reboot=disable", "-outputLog=$OutputLog")
+    }
+    else {
+        $displayName = "Dell Command Update Apply $UpdateType"
+        $arguments = @("/applyUpdates", "-silent", "-reboot=disable", "-updateType=$UpdateType", "-outputLog=$OutputLog")
+    }
+
+    if ($RestartDellClientManagementServiceBeforeDellApply -and -not $script:DellClientManagementServiceRestartedThisRun) {
+        Write-Log "RestartDellClientManagementServiceBeforeDellApply is enabled. Restarting Dell Client Management Service before DCU apply."
+        [void](Restart-DellClientManagementService `
+            -ForceStop $DellClientManagementServiceForceStop `
+            -WaitTimeoutSeconds $DellClientManagementServiceWaitTimeoutSeconds `
+            -PostStartDelaySeconds $DellClientManagementServicePostStartDelaySeconds)
+
+        $script:DellClientManagementServiceRestartedThisRun = $true
+    }
+
+    $attempt = 0
+    $result = $null
+
+    while ($attempt -le $DellDcuServiceRecoveryRetries) {
+        if ($attempt -gt 0) {
+            Write-Log "$displayName retry attempt $attempt after Dell Client Management Service recovery." "WARN"
+        }
+
+        $result = Invoke-LoggedProcess `
+            -Name $displayName `
+            -FilePath $DellCli `
+            -Arguments $arguments `
+            -SuccessExitCodes @(0, 500) `
+            -RebootExitCodes @(1, 5, 14) `
+            -WarningExitCodes @(6, 7) `
+            -NonFatalUnexpectedExitCodes $DellDcuServiceRecoveryExitCodes
+
+        if ($null -eq $result) {
+            return $result
+        }
+
+        if (-not ($DellDcuServiceRecoveryExitCodes -contains $result.ExitCode)) {
+            return $result
+        }
+
+        if (-not $RestartDellClientManagementServiceOnServiceError) {
+            $global:HadVendorFailure = $true
+            return $result
+        }
+
+        if ($attempt -ge $DellDcuServiceRecoveryRetries) {
+            Write-Log "$displayName returned Dell service-related exit code $($result.ExitCode), but retry limit has been reached." "WARN"
+            $global:HadVendorFailure = $true
+            return $result
+        }
+
+        Write-Log "$displayName returned Dell service-related exit code $($result.ExitCode). Restarting Dell Client Management Service and retrying." "WARN"
+
+        [void](Restart-DellClientManagementService `
+            -ForceStop $DellClientManagementServiceForceStop `
+            -WaitTimeoutSeconds $DellClientManagementServiceWaitTimeoutSeconds `
+            -PostStartDelaySeconds $DellClientManagementServicePostStartDelaySeconds)
+
+        $attempt++
+    }
+
+    return $result
+}
+
+# ============================================================
+# Lenovo helpers
+# ============================================================
 
 function Set-LenovoSystemUpdateSettings {
     param(
@@ -1085,6 +1356,7 @@ function Get-LenovoUpdateHistorySummary {
         SkippedCount = $skippedCount
         NotApplicableCount = $notApplicableCount
         RebootMentionCount = $rebootMentionCount
+        RebootMetadataFound = ($rebootMentionCount -gt 0)
         DetailLines = $detailLines
         LogFilesReviewed = $logFilesReviewed
         WmiItemsFound = $wmiItemsFound
@@ -1111,6 +1383,10 @@ function Get-LenovoUpdateHistorySummary {
         LikelyNoApplicableUpdates = $likelyNoApplicableUpdates
     }
 }
+
+# ============================================================
+# Vendor tool detection and install helpers
+# ============================================================
 
 function Test-DotNetDesktopRuntime8Installed {
     $desktopRuntimePaths = @(
@@ -1382,6 +1658,10 @@ function Install-HPImageAssistant {
     return $false
 }
 
+# ============================================================
+# Main
+# ============================================================
+
 $mutexName = "Global\OEMUpdateRunner"
 $mutex = New-Object System.Threading.Mutex($false, $mutexName)
 $hasMutex = $false
@@ -1441,6 +1721,7 @@ try {
     if ($dellCli) {
         $global:SupportedToolFound = $true
         $global:DellToolFound = $true
+        $script:DellClientManagementServiceRestartedThisRun = $false
 
         $dellNativeLogDir = "C:\ProgramData\Dell\OEMUpdateRunner\$RunStamp"
         New-Item -ItemType Directory -Path $dellNativeLogDir -Force | Out-Null
@@ -1465,13 +1746,10 @@ try {
 
             $global:DellApplyRan = $true
 
-            $dellApplyResult = Invoke-LoggedProcess `
-                -Name "Dell Command Update Apply $dellUpdateType" `
-                -FilePath $dellCli `
-                -Arguments @("/applyUpdates", "-silent", "-reboot=disable", "-updateType=$dellUpdateType", "-outputLog=$dellApplyLog") `
-                -SuccessExitCodes @(0, 500) `
-                -RebootExitCodes @(1, 5, 14) `
-                -WarningExitCodes @(6, 7)
+            $dellApplyResult = Invoke-DellCommandUpdateApplyWithServiceRecovery `
+                -DellCli $dellCli `
+                -UpdateType $dellUpdateType `
+                -OutputLog $dellApplyLog
 
             if ($null -ne $dellApplyResult -and $dellApplyResult.PSObject.Properties.Name -contains "Tool") {
                 $results += $dellApplyResult
@@ -1502,13 +1780,10 @@ try {
 
                 $global:DellApplyRan = $true
 
-                $dellFallbackResult = Invoke-LoggedProcess `
-                    -Name "Dell Command Update Apply Unfiltered" `
-                    -FilePath $dellCli `
-                    -Arguments @("/applyUpdates", "-silent", "-reboot=disable", "-outputLog=$dellFallbackLog") `
-                    -SuccessExitCodes @(0, 500) `
-                    -RebootExitCodes @(1, 5, 14) `
-                    -WarningExitCodes @(6, 7)
+                $dellFallbackResult = Invoke-DellCommandUpdateApplyWithServiceRecovery `
+                    -DellCli $dellCli `
+                    -OutputLog $dellFallbackLog `
+                    -Unfiltered
 
                 if ($null -ne $dellFallbackResult -and $dellFallbackResult.PSObject.Properties.Name -contains "Tool") {
                     $results += $dellFallbackResult
@@ -1600,6 +1875,7 @@ try {
             -MaxDetailLines $LenovoArtifactParseMaxDetailLines
 
         $global:LenovoLikelyNoApplicableUpdates = [bool]$lenovoHistory.LikelyNoApplicableUpdates
+        $global:LenovoRebootMetadataFound = [bool]$lenovoHistory.RebootMetadataFound
 
         Write-Log "Lenovo recent artifacts found: $($lenovoHistory.RecentArtifactsFound)"
         Write-Log "Lenovo artifact inventory file: $($lenovoHistory.InventoryFile)"
@@ -1618,7 +1894,7 @@ try {
         Write-Log "Lenovo UpdateTaskList child elements: $($lenovoHistory.TaskListChildElementCount)"
         Write-Log "Lenovo UpdateTaskList task-like elements: $($lenovoHistory.TaskListTaskLikeElementCount)"
         Write-Log "Lenovo UpdateTaskList empty: $($lenovoHistory.TaskListEmpty)"
-        Write-Log "Lenovo likely no applicable non-reboot updates: $($lenovoHistory.LikelyNoApplicableUpdates)"
+        Write-Log "Lenovo likely no applicable updates in requested scope: $($lenovoHistory.LikelyNoApplicableUpdates)"
 
         if ($lenovoHistory.TaskListParseError) {
             Write-Log "Lenovo UpdateTaskList parse error: $($lenovoHistory.TaskListParseError)" "WARN"
@@ -1650,8 +1926,13 @@ try {
         }
 
         if ($lenovoHistory.RebootMentionCount -gt 0) {
-            $global:RebootRequired = $true
-            Write-Log "Lenovo history parser found reboot/restart mentions. The script did not restart the endpoint." "WARN"
+            if ((-not $lenovoHistory.TaskListEmpty) -or $lenovoHistory.InstalledCount -gt 0) {
+                $global:RebootRequired = $true
+                Write-Log "Lenovo history parser found reboot/restart mentions tied to non-empty task list or installed updates. The script did not restart the endpoint." "WARN"
+            }
+            else {
+                Write-Log "Lenovo reboot/restart metadata was found, but UpdateTaskList is empty and no installs were parsed. Not marking endpoint as reboot-required from this run." "WARN"
+            }
         }
 
         if ($lenovoHistory.LikelyNoApplicableUpdates -and $lenovoResult.ExitCode -eq 1) {
@@ -1776,11 +2057,13 @@ try {
     Write-Log "Dell tool found: $global:DellToolFound"
     Write-Log "Dell tool bootstrapped: $global:DellToolBootstrapped"
     Write-Log "Dell apply ran: $global:DellApplyRan"
+    Write-Log "Dell Client Management Service recovered/restarted: $global:DellClientManagementServiceRecovered"
 
     Write-Log "Lenovo tool found: $global:LenovoToolFound"
     Write-Log "Lenovo tool bootstrapped: $global:LenovoToolBootstrapped"
     Write-Log "Lenovo apply ran: $global:LenovoApplyRan"
     Write-Log "Lenovo likely no applicable updates in requested scope: $global:LenovoLikelyNoApplicableUpdates"
+    Write-Log "Lenovo reboot metadata found: $global:LenovoRebootMetadataFound"
 
     Write-Log "HP tool found: $global:HPToolFound"
     Write-Log "HP tool bootstrapped: $global:HPToolBootstrapped"
@@ -1815,11 +2098,13 @@ try {
     Write-Output "OEMUPDATER_DELL_TOOL_FOUND=$global:DellToolFound"
     Write-Output "OEMUPDATER_DELL_TOOL_BOOTSTRAPPED=$global:DellToolBootstrapped"
     Write-Output "OEMUPDATER_DELL_APPLY_RAN=$global:DellApplyRan"
+    Write-Output "OEMUPDATER_DELL_CLIENT_MANAGEMENT_SERVICE_RECOVERED=$global:DellClientManagementServiceRecovered"
 
     Write-Output "OEMUPDATER_LENOVO_TOOL_FOUND=$global:LenovoToolFound"
     Write-Output "OEMUPDATER_LENOVO_TOOL_BOOTSTRAPPED=$global:LenovoToolBootstrapped"
     Write-Output "OEMUPDATER_LENOVO_APPLY_RAN=$global:LenovoApplyRan"
     Write-Output "OEMUPDATER_LENOVO_LIKELY_NO_APPLICABLE_UPDATES=$global:LenovoLikelyNoApplicableUpdates"
+    Write-Output "OEMUPDATER_LENOVO_REBOOT_METADATA_FOUND=$global:LenovoRebootMetadataFound"
 
     Write-Output "OEMUPDATER_HP_TOOL_FOUND=$global:HPToolFound"
     Write-Output "OEMUPDATER_HP_TOOL_BOOTSTRAPPED=$global:HPToolBootstrapped"
