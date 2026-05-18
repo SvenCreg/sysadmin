@@ -133,6 +133,24 @@ function Get-ProgramFiles64 {
     return $env:ProgramFiles
 }
 
+function Get-ProgramFilesX86 {
+    $path = [Environment]::GetEnvironmentVariable("ProgramFiles(x86)", "Machine")
+
+    if (-not $path) {
+        $path = [Environment]::GetEnvironmentVariable("ProgramFiles(x86)", "Process")
+    }
+
+    if (-not $path -and [Environment]::Is64BitOperatingSystem) {
+        $path = "C:\Program Files (x86)"
+    }
+
+    if (-not $path) {
+        $path = Get-ProgramFiles64
+    }
+
+    return $path
+}
+
 function Get-FirstExistingPath {
     param(
         [string[]]$Paths
@@ -834,7 +852,7 @@ function Add-LenovoParsedDetail {
     )
 
     if ($DetailList.Count -lt $MaxDetailLines) {
-        [void]$DetailList.Add("${Type}: [$SourceFile] $Line")
+        [void]$DetailList.Add(($Type + ": [" + $SourceFile + "] " + $Line))
     }
 }
 
@@ -1137,24 +1155,32 @@ function Install-DellCommandUpdate {
 
 function Find-DellCommandUpdateCli {
     $pf64 = Get-ProgramFiles64
+    $pf86 = Get-ProgramFilesX86
 
-    return Get-FirstExistingPath -Paths @(
-        "$pf64\Dell\CommandUpdate\dcu-cli.exe",
-        "${env: = Get-ProgramFiles64
-
-    return Get-FirstExistingPath -Paths @(
-        "$pf64\Dell\CommandUpdate\dcu-cli.exe",
-        "${env:ProgramFiles(x86)}\Dell\CommandUpdate\dcu-cli.exe"
+    $paths = @(
+        "$pf64\Dell\CommandUpdate\dcu-cli.exe"
     )
+
+    if ($pf86) {
+        $paths += "$pf86\Dell\CommandUpdate\dcu-cli.exe"
+    }
+
+    return Get-FirstExistingPath -Paths $paths
 }
 
 function Find-LenovoSystemUpdateCli {
     $pf64 = Get-ProgramFiles64
+    $pf86 = Get-ProgramFilesX86
 
-    return Get-FirstExistingPath -Paths @(
-        "$pf64\Lenovo\System Update\Tvsu.exe",
-        "${env:ProgramFiles(x86)}\Lenovo\System Update\Tvsu.exe"
+    $paths = @(
+        "$pf64\Lenovo\System Update\Tvsu.exe"
     )
+
+    if ($pf86) {
+        $paths += "$pf86\Lenovo\System Update\Tvsu.exe"
+    }
+
+    return Get-FirstExistingPath -Paths $paths
 }
 
 function Install-LenovoSystemUpdate {
@@ -1201,15 +1227,19 @@ function Install-LenovoSystemUpdate {
 
 function Find-HPImageAssistant {
     $pf64 = Get-ProgramFiles64
+    $pf86 = Get-ProgramFilesX86
 
     $knownPaths = @(
         "$HPImageAssistantInstallDir\HPImageAssistant.exe",
         "$pf64\HP\HP Image Assistant\HPImageAssistant.exe",
-        "${env:ProgramFiles(x86)}\HP\HP Image Assistant\HPImageAssistant.exe",
         "$pf64\HPIA\HPImageAssistant.exe",
-        "${env:ProgramFiles(x86)}\HPIA\HPImageAssistant.exe",
         "C:\SWSetup\HPImageAssistant.exe"
     )
+
+    if ($pf86) {
+        $knownPaths += "$pf86\HP\HP Image Assistant\HPImageAssistant.exe"
+        $knownPaths += "$pf86\HPIA\HPImageAssistant.exe"
+    }
 
     $known = Get-FirstExistingPath -Paths $knownPaths
 
