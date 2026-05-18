@@ -52,6 +52,11 @@ $DellCommandUpdateRepairRetriesPerRun = 1
 $DellCommandUpdateUninstallTimeoutMinutes = 15
 $DellCommandUpdateRepairPostInstallDelaySeconds = 30
 
+# .NET detection fallback.
+# Some systems do not expose the runtime immediately in registry after install.
+# If the installer exits successfully but detection still fails, allow Dell install to continue.
+$AssumeDotNetDesktopRuntime8InstalledAfterSuccessfulInstaller = $true
+
 $EnableLenovoDebugLogging = $true
 $LenovoArtifactLookbackMinutes = 15
 $LenovoArtifactInventoryMaxItems = 300
@@ -696,6 +701,44 @@ function Restart-DellClientManagementService {
     }
 }
 
+function Test-IsDellCommandUpdateDisplayName {
+    param(
+        [string]$DisplayName
+    )
+
+    if (-not $DisplayName) {
+        return $false
+    }
+
+    $name = $DisplayName.Trim()
+
+    if ($name -match "(?i)^Dell\s+Command\s*\|\s*Update") {
+        return $true
+    }
+
+    if ($name -match "(?i)^Dell\s+Command\s+Update") {
+        return $true
+    }
+
+    if ($name -match "(?i)^Dell\s+Update(\s+for\s+Windows\s+Universal)?$") {
+        return $true
+    }
+
+    if ($name -match "(?i)^Dell\s+Command\s*\|\s*Update\s+for\s+Windows\s+Universal") {
+        return $true
+    }
+
+    if ($name -match "(?i)^Dell\s+Command\s+Update\s+for\s+Windows\s+Universal") {
+        return $true
+    }
+
+    if ($name -match "(?i)^Dell\s+Client\s+Management\s+Service") {
+        return $true
+    }
+
+    return $false
+}
+
 function Get-DellCommandUpdateInstalledApp {
     $matches = [System.Collections.ArrayList]::new()
     $registryViews = @("Registry64", "Registry32")
@@ -722,21 +765,19 @@ function Get-DellCommandUpdateInstalledApp {
 
                 $displayName = [string]$subKey.GetValue("DisplayName")
 
-                if (-not $displayName) {
+                if (-not (Test-IsDellCommandUpdateDisplayName -DisplayName $displayName)) {
                     continue
                 }
 
-                if ($displayName -match "^(Dell Command \| Update|Dell Command Update)$") {
-                    [void]$matches.Add([pscustomobject]@{
-                        DisplayName = $displayName
-                        DisplayVersion = [string]$subKey.GetValue("DisplayVersion")
-                        UninstallString = [string]$subKey.GetValue("UninstallString")
-                        QuietUninstallString = [string]$subKey.GetValue("QuietUninstallString")
-                        WindowsInstaller = [string]$subKey.GetValue("WindowsInstaller")
-                        RegistryKeyName = $subName
-                        RegistryView = $view
-                    })
-                }
+                [void]$matches.Add([pscustomobject]@{
+                    DisplayName = $displayName
+                    DisplayVersion = [string]$subKey.GetValue("DisplayVersion")
+                    UninstallString = [string]$subKey.GetValue("UninstallString")
+                    QuietUninstallString = [string]$subKey.GetValue("QuietUninstallString")
+                    WindowsInstaller = [string]$subKey.GetValue("WindowsInstaller")
+                    RegistryKeyName = $subName
+                    RegistryView = $view
+                })
             }
         }
         catch {
@@ -744,7 +785,7 @@ function Get-DellCommandUpdateInstalledApp {
         }
     }
 
-    return @($matches | Sort-Object DisplayVersion -Descending)
+    return @($matches | Sort-Object DisplayName, DisplayVersion -Descending)
 }
 
 function Uninstall-DellCommandUpdate {
@@ -755,7 +796,14 @@ function Uninstall-DellCommandUpdate {
     $apps = @(Get-DellCommandUpdateInstalledApp)
 
     if ($apps.Count -eq 0) {
-        Write-Log "Dell Command Update uninstall entry was not found. It may already be removed." "WARN"
+        Write-Log "Dell Command Update uninstall entry was not found. It may already be removed or registered under an unexpected name." "WARN"
+
+        $existingCli = Find-DellCommandUpdateCli
+
+        if ($existingCli) {
+            Write-Log "Dell Command Update CLI still exists even though no uninstall entry was found: $existingCli" "WARN"
+        }
+
         return $true
     }
 
@@ -1690,12 +1738,55 @@ function Test-DotNetDesktopRuntime8Installed {
                 try {
                     $parsedVersion = [version]$version
 
-                    if ($parsedVersion.Major -eq 8 -and $parsedVersion -ge [version]"8.0.8") {
+                    if ($parsedVersion.Major -eq 8) {
+                        Write-Log ".NET Desktop Runtime 8 detected in registry: $version"
                         return $true
                     }
                 }
                 catch {}
             }
+        }
+    }
+
+    $dotnetSharedPaths = @(
+        "C:\Program Files\dotnet\shared\Microsoft.WindowsDesktop.App",
+        "C:\Program Files (x86)\dotnet\shared\Microsoft.WindowsDesktop.App"
+    )
+
+    foreach ($sharedPath in $dotnetSharedPaths) {
+        if (Test-Path -LiteralPath $sharedPath) {
+            $runtimeFolders = Get-ChildItem -LiteralPath $sharedPath -Directory -ErrorAction SilentlyContinue
+
+            foreach ($folder in $runtimeFolders) {
+                try {
+                    $parsedVersion = [version]$folder.Name
+
+                    if ($parsedVersion.Major -eq 8) {
+                        Write-Log ".NET Desktop Runtime 8 detected in shared runtime folder: $($folder.FullName)"
+                        return $true
+                    }
+                }
+                catch {}
+            }
+        }
+    }
+
+    $dotnetExeCandidates = @(
+        "C:\Program Files\dotnet\dotnet.exe",
+        "C:\Program Files (x86)\dotnet\dotnet.exe"
+    )
+
+    foreach ($dotnetExe in $dotnetExeCandidates) {
+        if (Test-Path -LiteralPath $dotnetExe) {
+            try {
+                $output = & $dotnetExe --list-runtimes 2>$null
+
+                if ($output -match "(?im)^Microsoft\.WindowsDesktop\.App\s+8\.") {
+                    Write-Log ".NET Desktop Runtime 8 detected using dotnet --list-runtimes at $dotnetExe"
+                    return $true
+                }
+            }
+            catch {}
         }
     }
 
@@ -1738,7 +1829,18 @@ function Install-DotNetDesktopRuntime8 {
 
     if ($runtimeResult.Success) {
         Start-Sleep -Seconds 10
-        return (Test-DotNetDesktopRuntime8Installed)
+
+        if (Test-DotNetDesktopRuntime8Installed) {
+            return $true
+        }
+
+        if ($AssumeDotNetDesktopRuntime8InstalledAfterSuccessfulInstaller) {
+            Write-Log ".NET Desktop Runtime 8 installer reported success, but immediate detection failed. Continuing because fallback is enabled." "WARN"
+            return $true
+        }
+
+        Write-Log ".NET Desktop Runtime 8 installer reported success, but runtime was not detected afterward." "WARN"
+        return $false
     }
 
     return $false
