@@ -8,6 +8,13 @@ Paste directly into a ConnectWise RMM PowerShell script.
 Run as System/Admin.
 Do not enable auto reboot.
 Recommended timeout: 120 minutes or higher.
+
+Notes:
+- Dell BIOS/Firmware are excluded by default.
+- Lenovo reboot-required packages are excluded by default.
+- HP BIOS/Firmware are excluded by default unless HPCategoryMode is set to All.
+- Dell, Lenovo, and HP tools can be downloaded/installed automatically if missing.
+- Lenovo history parsing is best-effort because Lenovo log/WMI output varies by System Update version.
 #>
 
 # ============================================================
@@ -19,6 +26,9 @@ $HPCategoryMode = "DriversSoftware"      # DriversSoftware or All
 
 $InstallDellCommandUpdateIfMissing = $true
 $InstallDotNetDesktopRuntimeIfMissing = $true
+
+$InstallLenovoSystemUpdateIfMissing = $true
+$InstallHPImageAssistantIfMissing = $true
 
 $IncludeDellBiosFirmware = $false
 $IncludeLenovoRebootPackages = $false
@@ -35,6 +45,11 @@ $ReturnNonZeroOnVendorFailure = $false
 
 $DellCommandUpdateInstallerUrl = "https://dl.dell.com/FOLDER14424601M/1/Dell-Command-Update-Windows-Universal-Application_FGK9X_WIN64_5.7.0_A00.EXE"
 $DotNetDesktopRuntime8Url = "https://aka.ms/dotnet/8.0/windowsdesktop-runtime-win-x64.exe"
+
+$LenovoSystemUpdateInstallerUrl = "https://download.lenovo.com/pccbbs/thinkvantage_en/system_update_5.08.03.59.exe"
+
+$HPImageAssistantInstallerUrl = "https://hpia.hpcloud.hp.com/downloads/hpia/hp-hpia-5.3.4.exe"
+$HPImageAssistantInstallDir = "C:\Program Files\HP\HPIA"
 
 # ============================================================
 # Script starts here
@@ -67,12 +82,17 @@ $global:SupportedToolFound = $false
 
 $global:DellToolFound = $false
 $global:DellApplyRan = $false
+$global:DellToolBootstrapped = $false
 
 $global:LenovoToolFound = $false
 $global:LenovoApplyRan = $false
+$global:LenovoToolBootstrapped = $false
 
 $global:HPToolFound = $false
 $global:HPApplyRan = $false
+$global:HPToolBootstrapped = $false
+
+$lenovoHistory = $null
 
 function Write-Log {
     param(
@@ -426,6 +446,197 @@ function Wait-ForProcessNames {
     $global:HadVendorWarning = $true
 }
 
+function Get-LenovoUpdateHistorySummary {
+    param(
+        [Parameter(Mandatory = $true)]
+        [datetime]$RunStartTime,
+
+        [int]$MaxDetailLines = 25
+    )
+
+    $detailLines = New-Object System.Collections.Generic.List[string]
+    $logFilesReviewed = New-Object System.Collections.Generic.List[string]
+    $wmiItems = New-Object System.Collections.Generic.List[string]
+
+    $installedCount = 0
+    $failedCount = 0
+    $skippedCount = 0
+    $notApplicableCount = 0
+    $rebootMentionCount = 0
+    $wmiItemsFound = 0
+
+    $logFolders = @(
+        "C:\ProgramData\Lenovo\System Update\logs",
+        "C:\ProgramData\Lenovo\SystemUpdate\logs",
+        "C:\ProgramData\Lenovo\SystemUpdate\session",
+        "C:\ProgramData\Lenovo\System Update"
+    )
+
+    $candidateLogs = @()
+
+    foreach ($folder in $logFolders) {
+        if (Test-Path -LiteralPath $folder) {
+            try {
+                $candidateLogs += Get-ChildItem -Path $folder -File -Recurse -ErrorAction SilentlyContinue |
+                    Where-Object {
+                        $_.LastWriteTime -ge $RunStartTime.AddMinutes(-5) -and
+                        $_.Extension -match "\.log|\.txt|\.xml"
+                    }
+            }
+            catch {}
+        }
+    }
+
+    $candidateLogs = @($candidateLogs | Sort-Object LastWriteTime -Descending -Unique)
+
+    foreach ($logFile in $candidateLogs) {
+        [void]$logFilesReviewed.Add($logFile.FullName)
+
+        try {
+            $lines = Get-Content -LiteralPath $logFile.FullName -ErrorAction Stop
+        }
+        catch {
+            continue
+        }
+
+        foreach ($line in $lines) {
+            $cleanLine = ($line -replace "\s+", " ").Trim()
+
+            if (-not $cleanLine) {
+                continue
+            }
+
+            if ($cleanLine -match "\b[1-9][0-9]*\s+(package|packages|update|updates)\s+(were\s+)?installed\b") {
+                $installedCount++
+
+                if ($detailLines.Count -lt $MaxDetailLines) {
+                    [void]$detailLines.Add("INSTALLED: $cleanLine")
+                }
+
+                continue
+            }
+
+            if ($cleanLine -match "\bsuccessfully installed\b") {
+                $installedCount++
+
+                if ($detailLines.Count -lt $MaxDetailLines) {
+                    [void]$detailLines.Add("INSTALLED: $cleanLine")
+                }
+
+                continue
+            }
+
+            if ($cleanLine -match "\binstall(ed|ation)?\b.*\b(success|successful|completed)\b") {
+                $installedCount++
+
+                if ($detailLines.Count -lt $MaxDetailLines) {
+                    [void]$detailLines.Add("INSTALLED: $cleanLine")
+                }
+
+                continue
+            }
+
+            if ($cleanLine -match "\b(fail|failed|failure|error)\b") {
+                $failedCount++
+
+                if ($detailLines.Count -lt $MaxDetailLines) {
+                    [void]$detailLines.Add("FAILED: $cleanLine")
+                }
+
+                continue
+            }
+
+            if ($cleanLine -match "\b(skip|skipped|not selected|not installed)\b") {
+                $skippedCount++
+
+                if ($detailLines.Count -lt $MaxDetailLines) {
+                    [void]$detailLines.Add("SKIPPED: $cleanLine")
+                }
+
+                continue
+            }
+
+            if ($cleanLine -match "\bnot applicable\b|\bno applicable\b|\bno updates\b|\bno packages\b|\bno package\b|\bno updates found\b") {
+                $notApplicableCount++
+
+                if ($detailLines.Count -lt $MaxDetailLines) {
+                    [void]$detailLines.Add("NOT_APPLICABLE: $cleanLine")
+                }
+
+                continue
+            }
+
+            if ($cleanLine -match "\breboot\b|\brestart\b") {
+                $rebootMentionCount++
+
+                if ($detailLines.Count -lt $MaxDetailLines) {
+                    [void]$detailLines.Add("REBOOT: $cleanLine")
+                }
+
+                continue
+            }
+        }
+    }
+
+    $wmiNamespacesToTry = @(
+        "root\Lenovo",
+        "root\Lenovo\Lenovo Updates",
+        "root\Lenovo\Lenovo_Updates",
+        "root\Lenovo\drivers"
+    )
+
+    foreach ($namespace in $wmiNamespacesToTry) {
+        try {
+            $classes = Get-CimClass -Namespace $namespace -ErrorAction Stop |
+                Where-Object {
+                    $_.CimClassName -match "Update|Package|Driver|Lenovo"
+                }
+
+            foreach ($class in $classes) {
+                try {
+                    $items = Get-CimInstance -Namespace $namespace -ClassName $class.CimClassName -ErrorAction Stop
+                }
+                catch {
+                    continue
+                }
+
+                foreach ($item in $items) {
+                    $wmiItemsFound++
+
+                    $props = $item.CimInstanceProperties |
+                        Where-Object {
+                            $_.Name -match "Package|Title|Name|Version|Severity|Status|Result|Applicable|Install"
+                        } |
+                        ForEach-Object {
+                            "$($_.Name)=$($_.Value)"
+                        }
+
+                    $wmiLine = "$namespace\$($class.CimClassName): " + ($props -join "; ")
+
+                    if ($wmiItems.Count -lt $MaxDetailLines) {
+                        [void]$wmiItems.Add($wmiLine)
+                    }
+                }
+            }
+        }
+        catch {
+            continue
+        }
+    }
+
+    return [pscustomobject]@{
+        InstalledCount = $installedCount
+        FailedCount = $failedCount
+        SkippedCount = $skippedCount
+        NotApplicableCount = $notApplicableCount
+        RebootMentionCount = $rebootMentionCount
+        DetailLines = $detailLines
+        LogFilesReviewed = $logFilesReviewed
+        WmiItemsFound = $wmiItemsFound
+        WmiItems = $wmiItems
+    }
+}
+
 function Test-DotNetDesktopRuntime8Installed {
     $desktopRuntimePaths = @(
         "HKLM:\SOFTWARE\dotnet\Setup\InstalledVersions\x64\sharedfx\Microsoft.WindowsDesktop.App",
@@ -544,10 +755,81 @@ function Find-DellCommandUpdateCli {
     )
 }
 
+function Find-LenovoSystemUpdateCli {
+    $pf64 = Get-ProgramFiles64
+
+    return Get-FirstExistingPath -Paths @(
+        "$pf64\Lenovo\System Update\Tvsu.exe",
+        "${env:ProgramFiles(x86)}\Lenovo\System Update\Tvsu.exe"
+    )
+}
+
+function Install-LenovoSystemUpdate {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DownloadFolder
+    )
+
+    $lenovoInstaller = Join-Path $DownloadFolder "Lenovo-System-Update-Installer.exe"
+    $lenovoInstallLog = Join-Path $DownloadFolder "Lenovo-System-Update-Install.log"
+
+    Write-Log "Downloading Lenovo System Update installer."
+    Write-Log "Lenovo System Update installer URL: $LenovoSystemUpdateInstallerUrl"
+
+    $downloaded = Invoke-FileDownload -Uri $LenovoSystemUpdateInstallerUrl -OutFile $lenovoInstaller
+
+    if (-not $downloaded) {
+        Write-Log "Failed to download Lenovo System Update installer." "ERROR"
+        $global:HadVendorFailure = $true
+        return $false
+    }
+
+    Write-Log "Installing Lenovo System Update silently."
+
+    $lenovoInstallResult = Invoke-LoggedProcess `
+        -Name "Lenovo System Update Installer" `
+        -FilePath $lenovoInstaller `
+        -Arguments @("/SP-", "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/LOG=$lenovoInstallLog") `
+        -SuccessExitCodes @(0) `
+        -RebootExitCodes @(3010) `
+        -WarningExitCodes @(1, 2)
+
+    if ($lenovoInstallResult.Success) {
+        Start-Sleep -Seconds 20
+
+        $lenovoPreferencePaths = @(
+            "HKLM:\SOFTWARE\Lenovo\System Update\Preferences\UserSettings\General",
+            "HKLM:\SOFTWARE\WOW6432Node\Lenovo\System Update\Preferences\UserSettings\General"
+        )
+
+        foreach ($prefPath in $lenovoPreferencePaths) {
+            try {
+                if (-not (Test-Path -LiteralPath $prefPath)) {
+                    New-Item -Path $prefPath -Force | Out-Null
+                }
+
+                New-ItemProperty -Path $prefPath -Name "MetricsEnabled" -Value "NO" -PropertyType String -Force | Out-Null
+                New-ItemProperty -Path $prefPath -Name "AskBeforeClosing" -Value "NO" -PropertyType String -Force | Out-Null
+                New-ItemProperty -Path $prefPath -Name "DisplayLicenseNotice" -Value "NO" -PropertyType String -Force | Out-Null
+                New-ItemProperty -Path $prefPath -Name "DisplayLicenseNoticeSU" -Value "NO" -PropertyType String -Force | Out-Null
+            }
+            catch {
+                Write-Log "Could not set Lenovo System Update preference registry values at $prefPath`: $($_.Exception.Message)" "WARN"
+            }
+        }
+
+        return $true
+    }
+
+    Write-Log "Lenovo System Update installer did not complete successfully." "WARN"
+    return $false
+}
+
 function Find-HPImageAssistant {
     $pf64 = Get-ProgramFiles64
 
     $knownPaths = @(
+        "$HPImageAssistantInstallDir\HPImageAssistant.exe",
         "$pf64\HP\HP Image Assistant\HPImageAssistant.exe",
         "${env:ProgramFiles(x86)}\HP\HP Image Assistant\HPImageAssistant.exe",
         "$pf64\HPIA\HPImageAssistant.exe",
@@ -561,17 +843,73 @@ function Find-HPImageAssistant {
         return $known
     }
 
-    if (Test-Path "C:\SWSetup") {
-        $found = Get-ChildItem -Path "C:\SWSetup" -Filter "HPImageAssistant.exe" -Recurse -ErrorAction SilentlyContinue |
-            Sort-Object LastWriteTime -Descending |
-            Select-Object -First 1
+    $searchRoots = @(
+        $HPImageAssistantInstallDir,
+        "C:\SWSetup"
+    )
 
-        if ($found) {
-            return $found.FullName
+    foreach ($root in $searchRoots) {
+        if (Test-Path -LiteralPath $root) {
+            $found = Get-ChildItem -Path $root -Filter "HPImageAssistant.exe" -Recurse -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending |
+                Select-Object -First 1
+
+            if ($found) {
+                return $found.FullName
+            }
         }
     }
 
     return $null
+}
+
+function Install-HPImageAssistant {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DownloadFolder
+    )
+
+    $hpiaInstaller = Join-Path $DownloadFolder "HP-Image-Assistant-Installer.exe"
+    $hpiaExtractDir = $HPImageAssistantInstallDir
+
+    Write-Log "Downloading HP Image Assistant installer."
+    Write-Log "HP Image Assistant installer URL: $HPImageAssistantInstallerUrl"
+
+    $downloaded = Invoke-FileDownload -Uri $HPImageAssistantInstallerUrl -OutFile $hpiaInstaller
+
+    if (-not $downloaded) {
+        Write-Log "Failed to download HP Image Assistant installer." "ERROR"
+        $global:HadVendorFailure = $true
+        return $false
+    }
+
+    New-Item -ItemType Directory -Path $hpiaExtractDir -Force | Out-Null
+
+    Write-Log "Extracting HP Image Assistant silently to $hpiaExtractDir"
+
+    $hpiaInstallResult = Invoke-LoggedProcess `
+        -Name "HP Image Assistant Installer" `
+        -FilePath $hpiaInstaller `
+        -Arguments @("/s", "/e", "/f$hpiaExtractDir") `
+        -SuccessExitCodes @(0, 1168) `
+        -RebootExitCodes @(3010)
+
+    if ($hpiaInstallResult.Success) {
+        Start-Sleep -Seconds 10
+
+        $hpia = Find-HPImageAssistant
+
+        if ($hpia) {
+            Write-Log "HP Image Assistant extracted successfully: $hpia"
+            return $true
+        }
+
+        Write-Log "HP Image Assistant installer completed, but HPImageAssistant.exe was not found after extraction." "WARN"
+        return $false
+    }
+
+    Write-Log "HP Image Assistant installer did not complete successfully." "WARN"
+    return $false
 }
 
 $mutexName = "Global\OEMUpdateRunner"
@@ -624,6 +962,7 @@ try {
         $installedDcu = Install-DellCommandUpdate -DownloadFolder $bootstrapDir
 
         if ($installedDcu) {
+            $global:DellToolBootstrapped = $true
             $dellCli = Find-DellCommandUpdateCli
         }
     }
@@ -718,16 +1057,27 @@ try {
     # -----------------------------
     # Lenovo System Update / TVSU
     # -----------------------------
-    $lenovoTvsu = Get-FirstExistingPath -Paths @(
-        "$pf64\Lenovo\System Update\Tvsu.exe",
-        "${env:ProgramFiles(x86)}\Lenovo\System Update\Tvsu.exe"
-    )
+    $lenovoTvsu = Find-LenovoSystemUpdateCli
+
+    if (-not $lenovoTvsu -and $system.Manufacturer -match "Lenovo" -and $InstallLenovoSystemUpdateIfMissing) {
+        Write-Log "Lenovo system detected, but Tvsu.exe was not found. InstallLenovoSystemUpdateIfMissing is enabled."
+
+        $bootstrapDir = Join-Path $RunLogDir "Bootstrap"
+        New-Item -ItemType Directory -Path $bootstrapDir -Force | Out-Null
+
+        $installedLenovoSystemUpdate = Install-LenovoSystemUpdate -DownloadFolder $bootstrapDir
+
+        if ($installedLenovoSystemUpdate) {
+            $global:LenovoToolBootstrapped = $true
+            $lenovoTvsu = Find-LenovoSystemUpdateCli
+        }
+    }
 
     if ($lenovoTvsu) {
         $global:SupportedToolFound = $true
         $global:LenovoToolFound = $true
 
-        $lenovoArgs = @("/CM", "-search", $LenovoSearchMode, "-action", "INSTALL", "-noicon", "-nolicense")
+        $lenovoArgs = @("/CM", "-search", $LenovoSearchMode, "-action", "INSTALL", "-noicon", "-nolicense", "-exporttowmi")
 
         if ($IncludeLenovoRebootPackages) {
             $lenovoArgs += @("-includerebootpackages", "1,3,4", "-noreboot")
@@ -740,6 +1090,7 @@ try {
         Write-Log "Running Lenovo System Update install step."
 
         $global:LenovoApplyRan = $true
+        $lenovoRunStart = Get-Date
 
         $lenovoResult = Invoke-LoggedProcess `
             -Name "Lenovo System Update Apply" `
@@ -756,6 +1107,33 @@ try {
             -Label "Lenovo System Update" `
             -ProcessNames @("tvsu", "tvsukernel", "tvsucommandlauncher", "tvsuscheduler") `
             -TimeoutMinutes $LenovoPostProcessWaitMinutes
+
+        $lenovoHistory = Get-LenovoUpdateHistorySummary -RunStartTime $lenovoRunStart
+
+        Write-Log "Lenovo history logs reviewed: $($lenovoHistory.LogFilesReviewed.Count)"
+        Write-Log "Lenovo WMI update items found: $($lenovoHistory.WmiItemsFound)"
+        Write-Log "Lenovo parsed installed count: $($lenovoHistory.InstalledCount)"
+        Write-Log "Lenovo parsed failed count: $($lenovoHistory.FailedCount)"
+        Write-Log "Lenovo parsed skipped count: $($lenovoHistory.SkippedCount)"
+        Write-Log "Lenovo parsed not-applicable/no-updates count: $($lenovoHistory.NotApplicableCount)"
+        Write-Log "Lenovo parsed reboot mentions: $($lenovoHistory.RebootMentionCount)"
+
+        foreach ($detailLine in $lenovoHistory.DetailLines) {
+            Write-Log "Lenovo detail: $detailLine"
+        }
+
+        foreach ($wmiLine in $lenovoHistory.WmiItems) {
+            Write-Log "Lenovo WMI: $wmiLine"
+        }
+
+        if ($lenovoHistory.FailedCount -gt 0) {
+            $global:HadVendorWarning = $true
+            Write-Log "Lenovo history parser found failure/error lines. Review Lenovo detail lines and TVSU logs." "WARN"
+        }
+
+        if ($lenovoHistory.RebootMentionCount -gt 0) {
+            Write-Log "Lenovo history parser found reboot/restart mentions. The script did not restart the endpoint." "WARN"
+        }
     }
     elseif (($system.Manufacturer -match "Lenovo") -or ($installedApps -match "Lenovo Vantage|Commercial Vantage|LenovoCommercialVantage|Lenovo System Update")) {
         Write-Log "Lenovo system or software detected, but Lenovo System Update CLI Tvsu.exe was not found. Skipping Lenovo updates. Lenovo Vantage GUI is intentionally not launched from RMM." "WARN"
@@ -765,6 +1143,20 @@ try {
     # HP Image Assistant
     # -----------------------------
     $hpia = Find-HPImageAssistant
+
+    if (-not $hpia -and (($system.Manufacturer -match "HP|Hewlett|Hewlett-Packard") -or ($system.Model -match "HP")) -and $InstallHPImageAssistantIfMissing) {
+        Write-Log "HP system detected, but HPImageAssistant.exe was not found. InstallHPImageAssistantIfMissing is enabled."
+
+        $bootstrapDir = Join-Path $RunLogDir "Bootstrap"
+        New-Item -ItemType Directory -Path $bootstrapDir -Force | Out-Null
+
+        $installedHPIA = Install-HPImageAssistant -DownloadFolder $bootstrapDir
+
+        if ($installedHPIA) {
+            $global:HPToolBootstrapped = $true
+            $hpia = Find-HPImageAssistant
+        }
+    }
 
     if ($hpia) {
         $global:SupportedToolFound = $true
@@ -851,11 +1243,24 @@ try {
     }
 
     Write-Log "Dell tool found: $global:DellToolFound"
+    Write-Log "Dell tool bootstrapped: $global:DellToolBootstrapped"
     Write-Log "Dell apply ran: $global:DellApplyRan"
+
     Write-Log "Lenovo tool found: $global:LenovoToolFound"
+    Write-Log "Lenovo tool bootstrapped: $global:LenovoToolBootstrapped"
     Write-Log "Lenovo apply ran: $global:LenovoApplyRan"
+
     Write-Log "HP tool found: $global:HPToolFound"
+    Write-Log "HP tool bootstrapped: $global:HPToolBootstrapped"
     Write-Log "HP apply ran: $global:HPApplyRan"
+
+    if ($lenovoHistory) {
+        Write-Log "Lenovo summary installed count: $($lenovoHistory.InstalledCount)"
+        Write-Log "Lenovo summary failed count: $($lenovoHistory.FailedCount)"
+        Write-Log "Lenovo summary skipped count: $($lenovoHistory.SkippedCount)"
+        Write-Log "Lenovo summary not-applicable/no-updates count: $($lenovoHistory.NotApplicableCount)"
+        Write-Log "Lenovo summary reboot mentions: $($lenovoHistory.RebootMentionCount)"
+    }
 
     Write-Log "Reboot required reported by vendor tool: $global:RebootRequired"
     Write-Log "Vendor warning detected: $global:HadVendorWarning"
@@ -864,15 +1269,42 @@ try {
 
     Write-Output "OEMUPDATER_RESULT=Complete"
     Write-Output "OEMUPDATER_SUPPORTED_TOOL_FOUND=$global:SupportedToolFound"
+
     Write-Output "OEMUPDATER_DELL_TOOL_FOUND=$global:DellToolFound"
+    Write-Output "OEMUPDATER_DELL_TOOL_BOOTSTRAPPED=$global:DellToolBootstrapped"
     Write-Output "OEMUPDATER_DELL_APPLY_RAN=$global:DellApplyRan"
+
     Write-Output "OEMUPDATER_LENOVO_TOOL_FOUND=$global:LenovoToolFound"
+    Write-Output "OEMUPDATER_LENOVO_TOOL_BOOTSTRAPPED=$global:LenovoToolBootstrapped"
     Write-Output "OEMUPDATER_LENOVO_APPLY_RAN=$global:LenovoApplyRan"
+
     Write-Output "OEMUPDATER_HP_TOOL_FOUND=$global:HPToolFound"
+    Write-Output "OEMUPDATER_HP_TOOL_BOOTSTRAPPED=$global:HPToolBootstrapped"
     Write-Output "OEMUPDATER_HP_APPLY_RAN=$global:HPApplyRan"
+
     Write-Output "OEMUPDATER_REBOOT_REQUIRED=$global:RebootRequired"
     Write-Output "OEMUPDATER_VENDOR_WARNING=$global:HadVendorWarning"
     Write-Output "OEMUPDATER_VENDOR_FAILURE=$global:HadVendorFailure"
+
+    if ($lenovoHistory) {
+        Write-Output "OEMUPDATER_LENOVO_HISTORY_LOGS_REVIEWED=$($lenovoHistory.LogFilesReviewed.Count)"
+        Write-Output "OEMUPDATER_LENOVO_WMI_ITEMS_FOUND=$($lenovoHistory.WmiItemsFound)"
+        Write-Output "OEMUPDATER_LENOVO_PARSED_INSTALLED=$($lenovoHistory.InstalledCount)"
+        Write-Output "OEMUPDATER_LENOVO_PARSED_FAILED=$($lenovoHistory.FailedCount)"
+        Write-Output "OEMUPDATER_LENOVO_PARSED_SKIPPED=$($lenovoHistory.SkippedCount)"
+        Write-Output "OEMUPDATER_LENOVO_PARSED_NOT_APPLICABLE=$($lenovoHistory.NotApplicableCount)"
+        Write-Output "OEMUPDATER_LENOVO_PARSED_REBOOT_MENTIONS=$($lenovoHistory.RebootMentionCount)"
+    }
+    else {
+        Write-Output "OEMUPDATER_LENOVO_HISTORY_LOGS_REVIEWED=0"
+        Write-Output "OEMUPDATER_LENOVO_WMI_ITEMS_FOUND=0"
+        Write-Output "OEMUPDATER_LENOVO_PARSED_INSTALLED=0"
+        Write-Output "OEMUPDATER_LENOVO_PARSED_FAILED=0"
+        Write-Output "OEMUPDATER_LENOVO_PARSED_SKIPPED=0"
+        Write-Output "OEMUPDATER_LENOVO_PARSED_NOT_APPLICABLE=0"
+        Write-Output "OEMUPDATER_LENOVO_PARSED_REBOOT_MENTIONS=0"
+    }
+
     Write-Output "OEMUPDATER_LOG=$MainLog"
 
     if ($ReturnNonZeroOnVendorFailure -and $global:HadVendorFailure) {
