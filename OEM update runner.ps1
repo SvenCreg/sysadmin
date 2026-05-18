@@ -7,6 +7,12 @@ ConnectWise RMM-safe OEM update runner
 Run as System/Admin.
 Do not enable auto reboot.
 Recommended timeout: 120 minutes or higher.
+
+Policy:
+- Install selected OEM updates.
+- Allow reboot-required updates where vendor CLI supports suppressing auto-reboot.
+- Never intentionally restart the endpoint.
+- BIOS/Firmware are excluded by default because those are highest reboot-risk.
 #>
 
 # ============================================================
@@ -22,8 +28,17 @@ $InstallDotNetDesktopRuntimeIfMissing = $true
 $InstallLenovoSystemUpdateIfMissing = $true
 $InstallHPImageAssistantIfMissing = $true
 
-$IncludeDellBiosFirmware = $false
-$IncludeLenovoRebootPackages = $false
+# Shared reboot policy
+$InstallRebootRequiredUpdatesNoAutoReboot = $true
+$IncludeBiosFirmwareUpdates = $false
+
+# Lenovo-specific reboot package handling.
+# "3" is the safest no-auto-reboot setting. Avoid "1,3,4" unless you accept higher vendor reboot/shutdown risk.
+$LenovoRebootPackageTypes = "3"
+
+# Backward-compatible knobs
+$IncludeDellBiosFirmware = $IncludeBiosFirmwareUpdates
+$IncludeLenovoRebootPackages = $InstallRebootRequiredUpdatesNoAutoReboot
 
 $EnableLenovoDebugLogging = $true
 $LenovoArtifactLookbackMinutes = 15
@@ -533,6 +548,9 @@ function Get-RecentLenovoArtifacts {
                         $_.FullName -match "(?i)lenovo|tvsu|system.update|systemupdate|applicability|update|trace|log" -or
                         $root -match "(?i)\\Lenovo"
                     )
+                } |
+                Where-Object {
+                    $_.FullName -notmatch "(?i)\\unins\d*\.dat$"
                 }
         }
         catch {
@@ -589,7 +607,7 @@ function Copy-LenovoKeyArtifacts {
     )
 
     $copyDir = Join-Path $RunLogDir "Lenovo-Key-Artifacts"
-    $copiedFiles = New-Object System.Collections.Generic.List[string]
+    $copiedFiles = [System.Collections.ArrayList]::new()
 
     try {
         New-Item -ItemType Directory -Path $copyDir -Force | Out-Null
@@ -645,7 +663,7 @@ function Get-LenovoUpdateTaskListSummary {
         [int]$MaxSamples = 10
     )
 
-    $samples = New-Object System.Collections.Generic.List[string]
+    $samples = [System.Collections.ArrayList]::new()
 
     $taskListFile = $Files |
         Where-Object { $_.FullName -match "(?i)\\UpdateTaskList\.xml$" } |
@@ -788,7 +806,7 @@ function Get-LenovoUpdateTaskListSummary {
                     break
                 }
 
-                $sampleParts = New-Object System.Collections.Generic.List[string]
+                $sampleParts = [System.Collections.ArrayList]::new()
                 [void]$sampleParts.Add("Element=$($node.LocalName)")
 
                 if ($node.Attributes) {
@@ -912,7 +930,7 @@ function Get-LenovoUpdateHistorySummary {
     )
 
     $detailLines = [System.Collections.ArrayList]::new()
-    $logFilesReviewed = New-Object System.Collections.Generic.List[string]
+    $logFilesReviewed = [System.Collections.ArrayList]::new()
     $wmiItems = [System.Collections.ArrayList]::new()
 
     $installedCount = 0
@@ -936,6 +954,9 @@ function Get-LenovoUpdateHistorySummary {
             $_.Extension -match "(?i)\.log|\.txt|\.xml|\.csv|\.dat" -and
             $_.Length -gt 0 -and
             $_.Length -lt 10485760
+        } |
+        Where-Object {
+            $_.FullName -notmatch "(?i)\\unins\d*\.dat$"
         })
 
     foreach ($logFile in $parseableArtifacts) {
@@ -1385,6 +1406,9 @@ try {
     Write-Log "Running as: $([Security.Principal.WindowsIdentity]::GetCurrent().Name)"
     Write-Log "Log folder: $RunLogDir"
 
+    Write-Log "Shared reboot policy: InstallRebootRequiredUpdatesNoAutoReboot=$InstallRebootRequiredUpdatesNoAutoReboot"
+    Write-Log "Shared reboot policy: IncludeBiosFirmwareUpdates=$IncludeBiosFirmwareUpdates"
+
     $system = Get-CimInstance -ClassName Win32_ComputerSystem
     $bios = Get-CimInstance -ClassName Win32_BIOS
 
@@ -1421,13 +1445,13 @@ try {
         $dellNativeLogDir = "C:\ProgramData\Dell\OEMUpdateRunner\$RunStamp"
         New-Item -ItemType Directory -Path $dellNativeLogDir -Force | Out-Null
 
-        if ($IncludeDellBiosFirmware) {
+        if ($IncludeBiosFirmwareUpdates) {
             $dellUpdateTypes = @("bios", "firmware", "driver", "application")
-            Write-Log "IncludeDellBiosFirmware enabled. BIOS and firmware updates may require restart even though reboot is disabled." "WARN"
+            Write-Log "Dell BIOS/Firmware updates are included. The script still passes -reboot=disable, but firmware/BIOS behavior is higher risk." "WARN"
         }
         else {
             $dellUpdateTypes = @("driver", "application")
-            Write-Log "Dell BIOS, firmware, and other update types are excluded by default to avoid forced or unexpected restarts."
+            Write-Log "Dell BIOS and firmware are excluded. Dell driver/application updates may still require reboot, and -reboot=disable is used."
         }
 
         $dellAny107 = $false
@@ -1437,7 +1461,7 @@ try {
             $dellApplyLog = Join-Path $dellNativeLogDir "Dell-Apply-$dellUpdateType.log"
 
             Write-Log "Running Dell apply step for update type: $dellUpdateType"
-            Write-Log "This is the step that actually installs available Dell $dellUpdateType updates."
+            Write-Log "Dell auto-reboot suppression is enabled with -reboot=disable."
 
             $global:DellApplyRan = $true
 
@@ -1528,12 +1552,25 @@ try {
 
         $lenovoArgs = @("/CM", "-search", $LenovoSearchMode, "-action", "INSTALL", "-noicon", "-nolicense", "-exporttowmi")
 
-        if ($IncludeLenovoRebootPackages) {
-            $lenovoArgs += @("-includerebootpackages", "1,3,4", "-noreboot")
-            Write-Log "IncludeLenovoRebootPackages enabled. Some Lenovo reboot package behavior is vendor controlled; reboot type 3 suppression does not mean every reboot type is suppressed." "WARN"
+        if ($InstallRebootRequiredUpdatesNoAutoReboot) {
+            $lenovoArgs += @("-includerebootpackages", $LenovoRebootPackageTypes, "-noreboot")
+
+            Write-Log "Lenovo reboot-required packages are included for reboot type(s): $LenovoRebootPackageTypes"
+            Write-Log "Lenovo -noreboot is enabled. Reboot type 3 is the recommended no-auto-reboot target." "WARN"
+
+            if ($LenovoRebootPackageTypes -ne "3") {
+                Write-Log "LenovoRebootPackageTypes is not exactly '3'. Including other Lenovo reboot types may carry higher vendor-controlled reboot/shutdown risk." "WARN"
+            }
         }
         else {
-            Write-Log "Lenovo reboot-required packages are excluded by default."
+            Write-Log "Lenovo reboot-required packages are excluded."
+        }
+
+        if ($IncludeBiosFirmwareUpdates) {
+            Write-Log "IncludeBiosFirmwareUpdates is enabled, but Lenovo BIOS/firmware inclusion is controlled by Lenovo package type and reboot package selection. Review Lenovo results carefully." "WARN"
+        }
+        else {
+            Write-Log "Lenovo BIOS/firmware are not explicitly targeted. Reboot package type 3 may still include some non-BIOS packages requiring reboot."
         }
 
         Write-Log "Running Lenovo System Update install step."
@@ -1546,6 +1583,7 @@ try {
             -FilePath $lenovoTvsu `
             -Arguments $lenovoArgs `
             -SuccessExitCodes @(0) `
+            -RebootExitCodes @(3010) `
             -WarningExitCodes @(1)
 
         if ($null -ne $lenovoResult -and $lenovoResult.PSObject.Properties.Name -contains "Tool") {
@@ -1612,11 +1650,12 @@ try {
         }
 
         if ($lenovoHistory.RebootMentionCount -gt 0) {
+            $global:RebootRequired = $true
             Write-Log "Lenovo history parser found reboot/restart mentions. The script did not restart the endpoint." "WARN"
         }
 
         if ($lenovoHistory.LikelyNoApplicableUpdates -and $lenovoResult.ExitCode -eq 1) {
-            Write-Log "Lenovo returned exit code 1, but UpdateTaskList appears container-only or empty and no Lenovo package failures were parsed. This likely means no applicable selected non-reboot updates." "WARN"
+            Write-Log "Lenovo returned exit code 1, but UpdateTaskList appears container-only or empty and no Lenovo package failures were parsed. This likely means no applicable selected updates in the requested scope." "WARN"
         }
     }
     elseif (($system.Manufacturer -match "Lenovo") -or ($installedApps -match "Lenovo Vantage|Commercial Vantage|LenovoCommercialVantage|Lenovo System Update")) {
@@ -1656,11 +1695,19 @@ try {
         }
         else {
             $hpCategories = @("Drivers", "Software")
-            Write-Log "HP category mode is DriversSoftware. HP Image Assistant will run separate Drivers and Software passes. BIOS and firmware are excluded by default."
+
+            if ($IncludeBiosFirmwareUpdates) {
+                $hpCategories += @("Firmware", "BIOS")
+                Write-Log "HP BIOS/Firmware categories are included. This is higher risk and may stage firmware/BIOS requiring reboot." "WARN"
+            }
+            else {
+                Write-Log "HP categories are Drivers and Software. BIOS and firmware are excluded."
+            }
         }
 
         foreach ($hpCategory in $hpCategories) {
             Write-Log "Running HP Image Assistant install step for category: $hpCategory"
+            Write-Log "HP Image Assistant may return 3010 when a reboot is required. The script will not restart the endpoint."
 
             $global:HPApplyRan = $true
 
@@ -1684,8 +1731,8 @@ try {
                     "/SoftPaqDownloadFolder:$categoryDownloadDir"
                 ) `
                 -SuccessExitCodes @(0, 256, 257) `
-                -RebootExitCodes @(3010) `
-                -WarningExitCodes @(3011, 4096, 4104)
+                -RebootExitCodes @(3010, 3011, 3020) `
+                -WarningExitCodes @(4096, 4104)
 
             if ($null -ne $hpResult -and $hpResult.PSObject.Properties.Name -contains "Tool") {
                 $results += $hpResult
@@ -1733,7 +1780,7 @@ try {
     Write-Log "Lenovo tool found: $global:LenovoToolFound"
     Write-Log "Lenovo tool bootstrapped: $global:LenovoToolBootstrapped"
     Write-Log "Lenovo apply ran: $global:LenovoApplyRan"
-    Write-Log "Lenovo likely no applicable non-reboot updates: $global:LenovoLikelyNoApplicableUpdates"
+    Write-Log "Lenovo likely no applicable updates in requested scope: $global:LenovoLikelyNoApplicableUpdates"
 
     Write-Log "HP tool found: $global:HPToolFound"
     Write-Log "HP tool bootstrapped: $global:HPToolBootstrapped"
@@ -1754,13 +1801,16 @@ try {
         Write-Log "Lenovo summary reboot mentions: $($lenovoHistory.RebootMentionCount)"
     }
 
-    Write-Log "Reboot required reported by vendor tool: $global:RebootRequired"
+    Write-Log "Reboot required reported by vendor tool or parsed logs: $global:RebootRequired"
     Write-Log "Vendor warning detected: $global:HadVendorWarning"
     Write-Log "Vendor failure detected: $global:HadVendorFailure"
     Write-Log "OEM update run complete."
 
     Write-Output "OEMUPDATER_RESULT=Complete"
     Write-Output "OEMUPDATER_SUPPORTED_TOOL_FOUND=$global:SupportedToolFound"
+
+    Write-Output "OEMUPDATER_INSTALL_REBOOT_REQUIRED_UPDATES_NO_AUTO_REBOOT=$InstallRebootRequiredUpdatesNoAutoReboot"
+    Write-Output "OEMUPDATER_INCLUDE_BIOS_FIRMWARE_UPDATES=$IncludeBiosFirmwareUpdates"
 
     Write-Output "OEMUPDATER_DELL_TOOL_FOUND=$global:DellToolFound"
     Write-Output "OEMUPDATER_DELL_TOOL_BOOTSTRAPPED=$global:DellToolBootstrapped"
