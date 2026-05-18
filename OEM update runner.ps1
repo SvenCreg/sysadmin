@@ -880,8 +880,7 @@ function Test-LenovoParserNoiseLine {
 
 function Add-LenovoParsedDetail {
     param(
-        [Parameter(Mandatory = $true)]
-        [System.Collections.Generic.List[string]]$DetailList,
+        $DetailList,
 
         [Parameter(Mandatory = $true)]
         [string]$Type,
@@ -894,6 +893,10 @@ function Add-LenovoParsedDetail {
 
         [int]$MaxDetailLines = 40
     )
+
+    if ($null -eq $DetailList) {
+        return
+    }
 
     if ($DetailList.Count -lt $MaxDetailLines) {
         [void]$DetailList.Add(($Type + ": [" + $SourceFile + "] " + $Line))
@@ -908,9 +911,9 @@ function Get-LenovoUpdateHistorySummary {
         [int]$MaxDetailLines = 40
     )
 
-    $detailLines = New-Object System.Collections.Generic.List[string]
+    $detailLines = [System.Collections.ArrayList]::new()
     $logFilesReviewed = New-Object System.Collections.Generic.List[string]
-    $wmiItems = New-Object System.Collections.Generic.List[string]
+    $wmiItems = [System.Collections.ArrayList]::new()
 
     $installedCount = 0
     $failedCount = 0
