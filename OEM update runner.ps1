@@ -16,6 +16,7 @@ Notes:
 - Dell, Lenovo, and HP tools can be downloaded/installed automatically if missing.
 - Lenovo history parsing is best-effort because Lenovo log/WMI output varies by System Update version.
 - Lenovo artifact discovery inventories recent Lenovo-related files after TVSU runs.
+- Lenovo key artifacts are copied into the RMM log folder for review.
 #>
 
 # ============================================================
@@ -94,6 +95,7 @@ $global:DellToolBootstrapped = $false
 $global:LenovoToolFound = $false
 $global:LenovoApplyRan = $false
 $global:LenovoToolBootstrapped = $false
+$global:LenovoLikelyNoApplicableUpdates = $false
 
 $global:HPToolFound = $false
 $global:HPApplyRan = $false
@@ -575,25 +577,239 @@ function Write-LenovoArtifactInventory {
     }
 }
 
+function Copy-LenovoKeyArtifacts {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$Files
+    )
+
+    $copyDir = Join-Path $RunLogDir "Lenovo-Key-Artifacts"
+    $copiedFiles = New-Object System.Collections.Generic.List[string]
+
+    try {
+        New-Item -ItemType Directory -Path $copyDir -Force | Out-Null
+    }
+    catch {
+        Write-Log "Could not create Lenovo key artifact folder $copyDir`: $($_.Exception.Message)" "WARN"
+        return [pscustomobject]@{
+            CopyDir = $copyDir
+            CopiedFiles = $copiedFiles
+        }
+    }
+
+    $keyFiles = @($Files | Where-Object {
+        $_.FullName -match "(?i)\\UpdateTaskList\.xml$" -or
+        $_.FullName -match "(?i)\\update_history\.db$" -or
+        $_.FullName -match "(?i)\\ApplicabilityRulesTrace\.txt$"
+    })
+
+    foreach ($file in $keyFiles) {
+        try {
+            $safeName = $file.FullName -replace "^[A-Za-z]:\\", ""
+            $safeName = $safeName -replace '[\\/:*?"<>|]', "_"
+
+            $destPath = Join-Path $copyDir $safeName
+
+            Copy-Item -LiteralPath $file.FullName -Destination $destPath -Force -ErrorAction Stop
+            [void]$copiedFiles.Add($destPath)
+        }
+        catch {
+            Write-Log "Could not copy Lenovo key artifact $($file.FullName): $($_.Exception.Message)" "WARN"
+        }
+    }
+
+    if ($copiedFiles.Count -gt 0) {
+        Write-Log "Copied $($copiedFiles.Count) Lenovo key artifact(s) to $copyDir"
+    }
+    else {
+        Write-Log "No Lenovo key artifacts were copied." "WARN"
+    }
+
+    return [pscustomobject]@{
+        CopyDir = $copyDir
+        CopiedFiles = $copiedFiles
+    }
+}
+
+function Get-LenovoUpdateTaskListSummary {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$Files,
+
+        [int]$MaxSamples = 10
+    )
+
+    $samples = New-Object System.Collections.Generic.List[string]
+
+    $taskListFile = @($Files |
+        Where-Object { $_.FullName -match "(?i)\\UpdateTaskList\.xml$" } |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -First 1)
+
+    if (-not $taskListFile) {
+        return [pscustomobject]@{
+            Found = $false
+            SourcePath = ""
+            SizeBytes = 0
+            ParseSucceeded = $false
+            ParseError = ""
+            RootName = ""
+            ChildElementCount = 0
+            TaskLikeElementCount = 0
+            Empty = $false
+            LikelyNoApplicableUpdates = $false
+            Samples = $samples
+        }
+    }
+
+    $sourcePath = $taskListFile.FullName
+    $sizeBytes = 0
+
+    try {
+        $sizeBytes = [int64]$taskListFile.Length
+    }
+    catch {}
+
+    $parseSucceeded = $false
+    $parseError = ""
+    $rootName = ""
+    $childElementCount = 0
+    $taskLikeElementCount = 0
+    $isEmpty = $false
+    $likelyNoApplicableUpdates = $false
+
+    try {
+        $rawXml = Get-Content -LiteralPath $sourcePath -Raw -ErrorAction Stop
+
+        if ([string]::IsNullOrWhiteSpace($rawXml)) {
+            $isEmpty = $true
+            $likelyNoApplicableUpdates = $true
+
+            return [pscustomobject]@{
+                Found = $true
+                SourcePath = $sourcePath
+                SizeBytes = $sizeBytes
+                ParseSucceeded = $true
+                ParseError = ""
+                RootName = ""
+                ChildElementCount = 0
+                TaskLikeElementCount = 0
+                Empty = $isEmpty
+                LikelyNoApplicableUpdates = $likelyNoApplicableUpdates
+                Samples = $samples
+            }
+        }
+
+        [xml]$xml = $rawXml
+        $parseSucceeded = $true
+
+        $root = $xml.DocumentElement
+
+        if ($root) {
+            $rootName = $root.LocalName
+        }
+
+        $allElements = @($xml.SelectNodes("//*"))
+
+        if ($root) {
+            $childElements = @($allElements | Where-Object { -not [object]::ReferenceEquals($_, $root) })
+        }
+        else {
+            $childElements = @($allElements)
+        }
+
+        $childElementCount = $childElements.Count
+
+        $taskLikeElements = @($childElements | Where-Object {
+            $_.LocalName -match "(?i)task|update|package|install|driver|firmware|software|reboot|dependency"
+        })
+
+        $taskLikeElementCount = $taskLikeElements.Count
+
+        foreach ($node in $taskLikeElements) {
+            if ($samples.Count -ge $MaxSamples) {
+                break
+            }
+
+            $sampleParts = New-Object System.Collections.Generic.List[string]
+            [void]$sampleParts.Add("Element=$($node.LocalName)")
+
+            if ($node.Attributes) {
+                foreach ($attrName in @("name","title","id","package","version","severity","status","result","reboot","type")) {
+                    $attr = $node.Attributes[$attrName]
+
+                    if ($attr -and $attr.Value) {
+                        [void]$sampleParts.Add("$attrName=$($attr.Value)")
+                    }
+                }
+            }
+
+            $inner = ""
+            try {
+                $inner = ($node.InnerText -replace "\s+", " ").Trim()
+            }
+            catch {}
+
+            if ($inner -and $inner.Length -le 200) {
+                [void]$sampleParts.Add("Text=$inner")
+            }
+
+            [void]$samples.Add(($sampleParts -join "; "))
+        }
+
+        if ($childElementCount -eq 0) {
+            $isEmpty = $true
+        }
+        elseif ($taskLikeElementCount -eq 0 -and $sizeBytes -lt 2048) {
+            $isEmpty = $true
+        }
+        else {
+            $isEmpty = $false
+        }
+
+        if ($isEmpty) {
+            $likelyNoApplicableUpdates = $true
+        }
+    }
+    catch {
+        $parseSucceeded = $false
+        $parseError = $_.Exception.Message
+    }
+
+    return [pscustomobject]@{
+        Found = $true
+        SourcePath = $sourcePath
+        SizeBytes = $sizeBytes
+        ParseSucceeded = $parseSucceeded
+        ParseError = $parseError
+        RootName = $rootName
+        ChildElementCount = $childElementCount
+        TaskLikeElementCount = $taskLikeElementCount
+        Empty = $isEmpty
+        LikelyNoApplicableUpdates = $likelyNoApplicableUpdates
+        Samples = $samples
+    }
+}
+
 function Test-LenovoParserNoiseLine {
     param(
         [Parameter(Mandatory = $true)]
         [string]$Line
     )
 
-    if ($Line -match "^(?i)(none|null|true|false|fffe|ffff|0x[0-9a-f]+|\d+)$") {
+    if ($Line -match "(?i)^(none|null|true|false|fffe|ffff|0x[0-9a-f]+|\d+)$") {
         return $true
     }
 
-    if ($Line -match "^(?i)Microsoft Hardware Error Device Driver$") {
+    if ($Line -match "(?i)^Microsoft Hardware Error Device Driver$") {
         return $true
     }
 
-    if ($Line -match "^(?i)Windows Error Reporting Service$") {
+    if ($Line -match "(?i)^Windows Error Reporting Service$") {
         return $true
     }
 
-    if ($Line -match "^(?i)Windows Error Reporting$") {
+    if ($Line -match "(?i)^Windows Error Reporting$") {
         return $true
     }
 
@@ -618,7 +834,7 @@ function Add-LenovoParsedDetail {
     )
 
     if ($DetailList.Count -lt $MaxDetailLines) {
-        [void]$DetailList.Add("$Type`: [$SourceFile] $Line")
+        [void]$DetailList.Add("${Type}: [$SourceFile] $Line")
     }
 }
 
@@ -647,6 +863,8 @@ function Get-LenovoUpdateHistorySummary {
         -MaxItems $LenovoArtifactInventoryMaxItems)
 
     $inventoryFile = Write-LenovoArtifactInventory -Files $recentArtifacts
+    $keyArtifactCopy = Copy-LenovoKeyArtifacts -Files $recentArtifacts
+    $taskListSummary = Get-LenovoUpdateTaskListSummary -Files $recentArtifacts
 
     $parseableArtifacts = @($recentArtifacts |
         Where-Object {
@@ -709,8 +927,6 @@ function Get-LenovoUpdateHistorySummary {
                 continue
             }
 
-            # Failure parsing is intentionally stricter to avoid false positives like:
-            # "Microsoft Hardware Error Device Driver" or "Windows Error Reporting Service".
             if ($hasStrongLenovoContext -and ($hasFailureWord -or $hasBadReturnCode)) {
                 $failedCount++
                 Add-LenovoParsedDetail -DetailList $detailLines -Type "FAILED" -SourceFile $logFile.FullName -Line $cleanLine -MaxDetailLines $MaxDetailLines
@@ -771,6 +987,12 @@ function Get-LenovoUpdateHistorySummary {
         }
     }
 
+    $likelyNoApplicableUpdates = $false
+
+    if ($taskListSummary.LikelyNoApplicableUpdates -and $installedCount -eq 0 -and $failedCount -eq 0) {
+        $likelyNoApplicableUpdates = $true
+    }
+
     return [pscustomobject]@{
         InstalledCount = $installedCount
         FailedCount = $failedCount
@@ -783,6 +1005,24 @@ function Get-LenovoUpdateHistorySummary {
         WmiItems = $wmiItems
         RecentArtifactsFound = $recentArtifacts.Count
         InventoryFile = $inventoryFile
+
+        KeyArtifactCopyDir = $keyArtifactCopy.CopyDir
+        KeyArtifactsCopied = $keyArtifactCopy.CopiedFiles.Count
+        KeyArtifactCopiedFiles = $keyArtifactCopy.CopiedFiles
+
+        TaskListFound = $taskListSummary.Found
+        TaskListPath = $taskListSummary.SourcePath
+        TaskListSizeBytes = $taskListSummary.SizeBytes
+        TaskListParseSucceeded = $taskListSummary.ParseSucceeded
+        TaskListParseError = $taskListSummary.ParseError
+        TaskListRootName = $taskListSummary.RootName
+        TaskListChildElementCount = $taskListSummary.ChildElementCount
+        TaskListTaskLikeElementCount = $taskListSummary.TaskLikeElementCount
+        TaskListEmpty = $taskListSummary.Empty
+        TaskListLikelyNoApplicableUpdates = $taskListSummary.LikelyNoApplicableUpdates
+        TaskListSamples = $taskListSummary.Samples
+
+        LikelyNoApplicableUpdates = $likelyNoApplicableUpdates
     }
 }
 
@@ -897,6 +1137,10 @@ function Install-DellCommandUpdate {
 
 function Find-DellCommandUpdateCli {
     $pf64 = Get-ProgramFiles64
+
+    return Get-FirstExistingPath -Paths @(
+        "$pf64\Dell\CommandUpdate\dcu-cli.exe",
+        "${env: = Get-ProgramFiles64
 
     return Get-FirstExistingPath -Paths @(
         "$pf64\Dell\CommandUpdate\dcu-cli.exe",
@@ -1244,8 +1488,35 @@ try {
             -RunStartTime $lenovoRunStart `
             -MaxDetailLines $LenovoArtifactParseMaxDetailLines
 
+        $global:LenovoLikelyNoApplicableUpdates = [bool]$lenovoHistory.LikelyNoApplicableUpdates
+
         Write-Log "Lenovo recent artifacts found: $($lenovoHistory.RecentArtifactsFound)"
         Write-Log "Lenovo artifact inventory file: $($lenovoHistory.InventoryFile)"
+        Write-Log "Lenovo key artifact copy folder: $($lenovoHistory.KeyArtifactCopyDir)"
+        Write-Log "Lenovo key artifacts copied: $($lenovoHistory.KeyArtifactsCopied)"
+
+        foreach ($copiedFile in $lenovoHistory.KeyArtifactCopiedFiles) {
+            Write-Log "Lenovo copied artifact: $copiedFile"
+        }
+
+        Write-Log "Lenovo UpdateTaskList found: $($lenovoHistory.TaskListFound)"
+        Write-Log "Lenovo UpdateTaskList path: $($lenovoHistory.TaskListPath)"
+        Write-Log "Lenovo UpdateTaskList size bytes: $($lenovoHistory.TaskListSizeBytes)"
+        Write-Log "Lenovo UpdateTaskList parse succeeded: $($lenovoHistory.TaskListParseSucceeded)"
+        Write-Log "Lenovo UpdateTaskList root name: $($lenovoHistory.TaskListRootName)"
+        Write-Log "Lenovo UpdateTaskList child elements: $($lenovoHistory.TaskListChildElementCount)"
+        Write-Log "Lenovo UpdateTaskList task-like elements: $($lenovoHistory.TaskListTaskLikeElementCount)"
+        Write-Log "Lenovo UpdateTaskList empty: $($lenovoHistory.TaskListEmpty)"
+        Write-Log "Lenovo likely no applicable non-reboot updates: $($lenovoHistory.LikelyNoApplicableUpdates)"
+
+        if ($lenovoHistory.TaskListParseError) {
+            Write-Log "Lenovo UpdateTaskList parse error: $($lenovoHistory.TaskListParseError)" "WARN"
+        }
+
+        foreach ($sample in $lenovoHistory.TaskListSamples) {
+            Write-Log "Lenovo UpdateTaskList sample: $sample"
+        }
+
         Write-Log "Lenovo history logs reviewed: $($lenovoHistory.LogFilesReviewed.Count)"
         Write-Log "Lenovo WMI update items found: $($lenovoHistory.WmiItemsFound)"
         Write-Log "Lenovo parsed installed count: $($lenovoHistory.InstalledCount)"
@@ -1269,6 +1540,10 @@ try {
 
         if ($lenovoHistory.RebootMentionCount -gt 0) {
             Write-Log "Lenovo history parser found reboot/restart mentions. The script did not restart the endpoint." "WARN"
+        }
+
+        if ($lenovoHistory.LikelyNoApplicableUpdates -and $lenovoResult.ExitCode -eq 1) {
+            Write-Log "Lenovo returned exit code 1, but UpdateTaskList appears empty and no Lenovo package failures were parsed. This likely means no applicable selected non-reboot updates." "WARN"
         }
     }
     elseif (($system.Manufacturer -match "Lenovo") -or ($installedApps -match "Lenovo Vantage|Commercial Vantage|LenovoCommercialVantage|Lenovo System Update")) {
@@ -1385,6 +1660,7 @@ try {
     Write-Log "Lenovo tool found: $global:LenovoToolFound"
     Write-Log "Lenovo tool bootstrapped: $global:LenovoToolBootstrapped"
     Write-Log "Lenovo apply ran: $global:LenovoApplyRan"
+    Write-Log "Lenovo likely no applicable non-reboot updates: $global:LenovoLikelyNoApplicableUpdates"
 
     Write-Log "HP tool found: $global:HPToolFound"
     Write-Log "HP tool bootstrapped: $global:HPToolBootstrapped"
@@ -1393,6 +1669,11 @@ try {
     if ($lenovoHistory) {
         Write-Log "Lenovo summary recent artifacts found: $($lenovoHistory.RecentArtifactsFound)"
         Write-Log "Lenovo summary artifact inventory file: $($lenovoHistory.InventoryFile)"
+        Write-Log "Lenovo summary key artifacts copied: $($lenovoHistory.KeyArtifactsCopied)"
+        Write-Log "Lenovo summary key artifact copy folder: $($lenovoHistory.KeyArtifactCopyDir)"
+        Write-Log "Lenovo summary UpdateTaskList found: $($lenovoHistory.TaskListFound)"
+        Write-Log "Lenovo summary UpdateTaskList empty: $($lenovoHistory.TaskListEmpty)"
+        Write-Log "Lenovo summary likely no applicable updates: $($lenovoHistory.LikelyNoApplicableUpdates)"
         Write-Log "Lenovo summary installed count: $($lenovoHistory.InstalledCount)"
         Write-Log "Lenovo summary failed count: $($lenovoHistory.FailedCount)"
         Write-Log "Lenovo summary skipped count: $($lenovoHistory.SkippedCount)"
@@ -1415,6 +1696,7 @@ try {
     Write-Output "OEMUPDATER_LENOVO_TOOL_FOUND=$global:LenovoToolFound"
     Write-Output "OEMUPDATER_LENOVO_TOOL_BOOTSTRAPPED=$global:LenovoToolBootstrapped"
     Write-Output "OEMUPDATER_LENOVO_APPLY_RAN=$global:LenovoApplyRan"
+    Write-Output "OEMUPDATER_LENOVO_LIKELY_NO_APPLICABLE_UPDATES=$global:LenovoLikelyNoApplicableUpdates"
 
     Write-Output "OEMUPDATER_HP_TOOL_FOUND=$global:HPToolFound"
     Write-Output "OEMUPDATER_HP_TOOL_BOOTSTRAPPED=$global:HPToolBootstrapped"
@@ -1427,6 +1709,18 @@ try {
     if ($lenovoHistory) {
         Write-Output "OEMUPDATER_LENOVO_RECENT_ARTIFACTS_FOUND=$($lenovoHistory.RecentArtifactsFound)"
         Write-Output "OEMUPDATER_LENOVO_ARTIFACT_INVENTORY=$($lenovoHistory.InventoryFile)"
+        Write-Output "OEMUPDATER_LENOVO_KEY_ARTIFACT_COPY_DIR=$($lenovoHistory.KeyArtifactCopyDir)"
+        Write-Output "OEMUPDATER_LENOVO_KEY_ARTIFACTS_COPIED=$($lenovoHistory.KeyArtifactsCopied)"
+
+        Write-Output "OEMUPDATER_LENOVO_TASKLIST_FOUND=$($lenovoHistory.TaskListFound)"
+        Write-Output "OEMUPDATER_LENOVO_TASKLIST_PATH=$($lenovoHistory.TaskListPath)"
+        Write-Output "OEMUPDATER_LENOVO_TASKLIST_SIZE_BYTES=$($lenovoHistory.TaskListSizeBytes)"
+        Write-Output "OEMUPDATER_LENOVO_TASKLIST_PARSE_SUCCEEDED=$($lenovoHistory.TaskListParseSucceeded)"
+        Write-Output "OEMUPDATER_LENOVO_TASKLIST_CHILD_ELEMENTS=$($lenovoHistory.TaskListChildElementCount)"
+        Write-Output "OEMUPDATER_LENOVO_TASKLIST_TASKLIKE_ELEMENTS=$($lenovoHistory.TaskListTaskLikeElementCount)"
+        Write-Output "OEMUPDATER_LENOVO_TASKLIST_EMPTY=$($lenovoHistory.TaskListEmpty)"
+        Write-Output "OEMUPDATER_LENOVO_TASKLIST_LIKELY_NO_APPLICABLE_UPDATES=$($lenovoHistory.TaskListLikelyNoApplicableUpdates)"
+
         Write-Output "OEMUPDATER_LENOVO_HISTORY_LOGS_REVIEWED=$($lenovoHistory.LogFilesReviewed.Count)"
         Write-Output "OEMUPDATER_LENOVO_WMI_ITEMS_FOUND=$($lenovoHistory.WmiItemsFound)"
         Write-Output "OEMUPDATER_LENOVO_PARSED_INSTALLED=$($lenovoHistory.InstalledCount)"
@@ -1438,6 +1732,18 @@ try {
     else {
         Write-Output "OEMUPDATER_LENOVO_RECENT_ARTIFACTS_FOUND=0"
         Write-Output "OEMUPDATER_LENOVO_ARTIFACT_INVENTORY="
+        Write-Output "OEMUPDATER_LENOVO_KEY_ARTIFACT_COPY_DIR="
+        Write-Output "OEMUPDATER_LENOVO_KEY_ARTIFACTS_COPIED=0"
+
+        Write-Output "OEMUPDATER_LENOVO_TASKLIST_FOUND=False"
+        Write-Output "OEMUPDATER_LENOVO_TASKLIST_PATH="
+        Write-Output "OEMUPDATER_LENOVO_TASKLIST_SIZE_BYTES=0"
+        Write-Output "OEMUPDATER_LENOVO_TASKLIST_PARSE_SUCCEEDED=False"
+        Write-Output "OEMUPDATER_LENOVO_TASKLIST_CHILD_ELEMENTS=0"
+        Write-Output "OEMUPDATER_LENOVO_TASKLIST_TASKLIKE_ELEMENTS=0"
+        Write-Output "OEMUPDATER_LENOVO_TASKLIST_EMPTY=False"
+        Write-Output "OEMUPDATER_LENOVO_TASKLIST_LIKELY_NO_APPLICABLE_UPDATES=False"
+
         Write-Output "OEMUPDATER_LENOVO_HISTORY_LOGS_REVIEWED=0"
         Write-Output "OEMUPDATER_LENOVO_WMI_ITEMS_FOUND=0"
         Write-Output "OEMUPDATER_LENOVO_PARSED_INSTALLED=0"
