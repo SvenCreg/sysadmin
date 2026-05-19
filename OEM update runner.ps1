@@ -45,12 +45,17 @@ $DellClientManagementServicePostStartDelaySeconds = 20
 $DellDcuServiceRecoveryExitCodes = @(3000, 3002, 3003, 3004, 3005)
 $DellDcuServiceRecoveryRetries = 1
 
-# Dell Command Update repair/reinstall path for persistent service-busy state
+# Dell Command Update repair path for persistent service-busy state.
+# Default is intentionally conservative: try Chocolatey forced upgrade/repair first, then Dell EXE in-place repair.
+# Avoid uninstall/reinstall by default because failed MSI removal can leave DCU in a broken 1714/1612 state.
 $RepairDellCommandUpdateOnPersistentServiceBusy = $true
 $DellCommandUpdateRepairOnExitCodes = @(3005)
 $DellCommandUpdateRepairRetriesPerRun = 1
 $DellCommandUpdateUninstallTimeoutMinutes = 15
 $DellCommandUpdateRepairPostInstallDelaySeconds = 30
+$DellCommandUpdateAllowUninstallReinstallRepair = $false
+$DellCommandUpdateMsiSourceErrorCodes = @(1612, 1714)
+$DellCommandUpdateEnableMsiSourceErrorRegistryCleanup = $true
 
 # .NET detection fallback.
 # Some systems do not expose the runtime immediately in registry after install.
@@ -90,13 +95,14 @@ $DellCommandUpdateKnownDirectUrls = @(
 # Optional local path. Leave blank unless you later decide to attach/cache the installer locally on endpoints.
 $DellCommandUpdateInstallerLocalPath = ""
 
-# Chocolatey fallback is useful when DCU is missing and Dell direct download is blocked.
-# For repair/reinstall, the script first pre-downloads an EXE before uninstalling existing DCU.
-# During persistent Dell 3005 repair, Chocolatey is attempted FIRST.
-# If Chocolatey is unavailable/fails, the script tries Dell EXE download sources.
-# The script will not uninstall existing DCU unless a replacement EXE is already cached.
+# Chocolatey fallback is useful when DCU is missing, Dell direct download is blocked, or DCU repair is needed.
+# If choco.exe is missing and InstallChocolateyIfMissing is enabled, the script installs Chocolatey first.
 $UseChocolateyFallbackForDellCommandUpdateInstall = $true
 $UseChocolateyFallbackForDellCommandUpdateRepair = $true
+$InstallChocolateyIfMissing = $true
+$ChocolateyInstallScriptUrl = "https://community.chocolatey.org/install.ps1"
+$ChocolateyInstallTimeoutMinutes = 15
+$ChocolateyInstallPostInstallDelaySeconds = 10
 $ChocolateyDellCommandUpdatePackageId = "dellcommandupdate"
 $DotNetDesktopRuntime8Url = "https://aka.ms/dotnet/8.0/windowsdesktop-runtime-win-x64.exe"
 
@@ -141,6 +147,9 @@ $global:DellClientManagementServiceRecovered = $false
 $global:DellCommandUpdateRepairAttempted = $false
 $global:DellCommandUpdateRepairSucceeded = $false
 $global:DellStopFurtherApplyAttempts = $false
+$script:LastDellCommandUpdateInstallerExitCode = $null
+$script:LastDellCommandUpdateInstallerLog = ""
+$script:LastDellCommandUpdateInstallerHadMsiSourceError = $false
 
 $global:LenovoToolFound = $false
 $global:LenovoApplyRan = $false
@@ -1030,18 +1039,18 @@ function Repair-DellCommandUpdate {
         Write-Log "Chocolatey Dell Command Update repair is disabled."
     }
 
-    Write-Log "Pre-downloading and verifying Dell Command Update installer before uninstalling existing DCU. Existing DCU will not be removed unless the replacement installer is cached locally first."
+    Write-Log "Pre-downloading and verifying Dell Command Update installer for in-place repair. Existing DCU will not be uninstalled by default."
     $preDownloadedDcuInstaller = Get-DellCommandUpdateInstallerFile -DownloadFolder $DownloadFolder
 
     if (-not $preDownloadedDcuInstaller -or -not (Test-Path -LiteralPath $preDownloadedDcuInstaller)) {
-        Write-Log "Dell Command Update repair aborted because replacement installer could not be downloaded and verified. Existing DCU will not be uninstalled." "ERROR"
+        Write-Log "Dell Command Update repair aborted because replacement installer could not be downloaded and verified." "ERROR"
         $global:DellCommandUpdateRepairSucceeded = $false
         return $false
     }
 
     if ($svcName) {
         try {
-            Write-Log "Stopping Dell Client Management Service before Dell Command Update uninstall/reinstall."
+            Write-Log "Stopping Dell Client Management Service before Dell Command Update in-place repair."
             Stop-Service -Name $svcName -Force -ErrorAction SilentlyContinue
 
             [void](Wait-ServiceStatus `
@@ -1050,23 +1059,69 @@ function Repair-DellCommandUpdate {
                 -TimeoutSeconds $DellClientManagementServiceWaitTimeoutSeconds)
         }
         catch {
-            Write-Log "Could not stop Dell Client Management Service before uninstall/reinstall: $($_.Exception.Message)" "WARN"
+            Write-Log "Could not stop Dell Client Management Service before in-place repair: $($_.Exception.Message)" "WARN"
         }
     }
 
-    $uninstallSucceeded = Uninstall-DellCommandUpdate -TimeoutMinutes $DellCommandUpdateUninstallTimeoutMinutes
-
-    if (-not $uninstallSucceeded) {
-        Write-Log "Dell Command Update uninstall had warnings or failures. Continuing with reinstall attempt because replacement installer is already cached." "WARN"
-    }
+    Write-Log "Trying Dell Command Update EXE in-place repair/install before any uninstall attempt."
 
     $installed = Install-DellCommandUpdate `
         -DownloadFolder $DownloadFolder `
         -PreDownloadedInstallerPath $preDownloadedDcuInstaller `
         -AllowChocolateyFallback $false
 
+    if (-not $installed -and $script:LastDellCommandUpdateInstallerHadMsiSourceError) {
+        Write-Log "Dell Command Update in-place repair detected MSI 1612/1714-style source/removal errors. Attempting targeted stale Dell DCU MSI registration cleanup, then one reinstall retry." "WARN"
+
+        $msiCleanupBackupDir = Join-Path $DownloadFolder "Dell-MSI-Source-Error-Registry-Backup"
+        $cleanupSucceeded = Invoke-DellCommandUpdateMsiSourceErrorCleanup -BackupFolder $msiCleanupBackupDir
+
+        if ($cleanupSucceeded) {
+            $installed = Install-DellCommandUpdate `
+                -DownloadFolder $DownloadFolder `
+                -PreDownloadedInstallerPath $preDownloadedDcuInstaller `
+                -AllowChocolateyFallback $false
+        }
+    }
+
     if (-not $installed) {
-        Write-Log "Dell Command Update repair failed because reinstall did not complete successfully." "ERROR"
+        if (-not $DellCommandUpdateAllowUninstallReinstallRepair) {
+            Write-Log "Dell Command Update repair failed, but DellCommandUpdateAllowUninstallReinstallRepair is disabled. Not uninstalling DCU because failed uninstall/reinstall is the path that can leave MSI 1714/1612 corruption." "ERROR"
+            $global:DellCommandUpdateRepairSucceeded = $false
+            return $false
+        }
+
+        Write-Log "DellCommandUpdateAllowUninstallReinstallRepair is enabled. Proceeding with uninstall/reinstall as a last resort because in-place repair failed and replacement installer is cached." "WARN"
+
+        if ($svcName) {
+            try {
+                Write-Log "Stopping Dell Client Management Service before Dell Command Update last-resort uninstall/reinstall."
+                Stop-Service -Name $svcName -Force -ErrorAction SilentlyContinue
+
+                [void](Wait-ServiceStatus `
+                    -ServiceName $svcName `
+                    -DesiredStatus "Stopped" `
+                    -TimeoutSeconds $DellClientManagementServiceWaitTimeoutSeconds)
+            }
+            catch {
+                Write-Log "Could not stop Dell Client Management Service before last-resort uninstall/reinstall: $($_.Exception.Message)" "WARN"
+            }
+        }
+
+        $uninstallSucceeded = Uninstall-DellCommandUpdate -TimeoutMinutes $DellCommandUpdateUninstallTimeoutMinutes
+
+        if (-not $uninstallSucceeded) {
+            Write-Log "Dell Command Update uninstall had warnings or failures. Continuing with reinstall attempt because replacement installer is already cached." "WARN"
+        }
+
+        $installed = Install-DellCommandUpdate `
+            -DownloadFolder $DownloadFolder `
+            -PreDownloadedInstallerPath $preDownloadedDcuInstaller `
+            -AllowChocolateyFallback $false
+    }
+
+    if (-not $installed) {
+        Write-Log "Dell Command Update repair failed because install/repair did not complete successfully." "ERROR"
         $global:DellCommandUpdateRepairSucceeded = $false
         return $false
     }
@@ -1076,12 +1131,12 @@ function Repair-DellCommandUpdate {
     $newCli = Find-DellCommandUpdateCli
 
     if (-not $newCli) {
-        Write-Log "Dell Command Update repair failed because dcu-cli.exe was not found after reinstall." "ERROR"
+        Write-Log "Dell Command Update repair failed because dcu-cli.exe was not found after repair/install." "ERROR"
         $global:DellCommandUpdateRepairSucceeded = $false
         return $false
     }
 
-    Write-Log "Dell Command Update repair/reinstall completed. New CLI path: $newCli"
+    Write-Log "Dell Command Update repair/install completed. New CLI path: $newCli"
 
     [void](Restart-DellClientManagementService `
         -ForceStop $DellClientManagementServiceForceStop `
@@ -2213,6 +2268,320 @@ function Find-ChocolateyExecutable {
     return $null
 }
 
+
+function Ensure-ChocolateyInstalled {
+    $choco = Find-ChocolateyExecutable
+
+    if ($choco) {
+        Write-Log "Chocolatey detected: $choco"
+        return $choco
+    }
+
+    Write-Log "Chocolatey was not found on this endpoint." "WARN"
+
+    if (-not $InstallChocolateyIfMissing) {
+        Write-Log "InstallChocolateyIfMissing is disabled. Chocolatey-dependent fallback cannot run." "WARN"
+        return $null
+    }
+
+    if ([string]::IsNullOrWhiteSpace($ChocolateyInstallScriptUrl)) {
+        Write-Log "ChocolateyInstallScriptUrl is blank. Cannot install Chocolatey." "WARN"
+        return $null
+    }
+
+    $chocoBootstrapDir = Join-Path $RunLogDir "ChocolateyBootstrap"
+    New-Item -ItemType Directory -Path $chocoBootstrapDir -Force | Out-Null
+
+    $installScript = Join-Path $chocoBootstrapDir "install-chocolatey.ps1"
+    $downloaded = Invoke-FileDownload -Uri $ChocolateyInstallScriptUrl -OutFile $installScript
+
+    if (-not $downloaded -or -not (Test-Path -LiteralPath $installScript)) {
+        Write-Log "Could not download the Chocolatey install script." "ERROR"
+        $global:HadVendorWarning = $true
+        return $null
+    }
+
+    $powerShellPath = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"
+
+    if (-not (Test-Path -LiteralPath $powerShellPath)) {
+        $powerShellCommand = Get-Command powershell.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+
+        if ($powerShellCommand -and $powerShellCommand.Source) {
+            $powerShellPath = $powerShellCommand.Source
+        }
+    }
+
+    if (-not (Test-Path -LiteralPath $powerShellPath)) {
+        Write-Log "powershell.exe was not found. Cannot install Chocolatey." "ERROR"
+        $global:HadVendorWarning = $true
+        return $null
+    }
+
+    $oldTimeout = $script:VendorTimeoutMinutes
+    $script:VendorTimeoutMinutes = $ChocolateyInstallTimeoutMinutes
+
+    try {
+        Write-Log "Installing Chocolatey because choco.exe is missing."
+
+        $installResult = Invoke-LoggedProcess `
+            -Name "Chocolatey Bootstrap Install" `
+            -FilePath $powerShellPath `
+            -Arguments @("-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", $installScript) `
+            -SuccessExitCodes @(0) `
+            -RebootExitCodes @()
+
+        if (-not $installResult.Success) {
+            Write-Log "Chocolatey bootstrap install did not report success. ExitCode=$($installResult.ExitCode)" "WARN"
+            $global:HadVendorWarning = $true
+            return $null
+        }
+    }
+    finally {
+        $script:VendorTimeoutMinutes = $oldTimeout
+    }
+
+    if ($ChocolateyInstallPostInstallDelaySeconds -gt 0) {
+        Start-Sleep -Seconds $ChocolateyInstallPostInstallDelaySeconds
+    }
+
+    $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+    $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+    $processPathParts = @($env:Path, $machinePath, $userPath) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    $env:Path = ($processPathParts -join ";")
+
+    $choco = Find-ChocolateyExecutable
+
+    if ($choco) {
+        Write-Log "Chocolatey installed successfully: $choco"
+        return $choco
+    }
+
+    Write-Log "Chocolatey bootstrap reported success, but choco.exe was still not found." "WARN"
+    $global:HadVendorWarning = $true
+    return $null
+}
+
+function Test-LogContainsDellMsiSourceError {
+    param(
+        [string[]]$Paths
+    )
+
+    foreach ($path in $Paths) {
+        if ([string]::IsNullOrWhiteSpace($path) -or -not (Test-Path -LiteralPath $path)) {
+            continue
+        }
+
+        try {
+            $patterns = @()
+
+            foreach ($code in $DellCommandUpdateMsiSourceErrorCodes) {
+                $patterns += "(?i)\b$code\b"
+                $patterns += "(?i)error\s+$code"
+            }
+
+            $patterns += "(?i)older\s+version\s+.*cannot\s+be\s+removed"
+            $patterns += "(?i)installation\s+source\s+.*not\s+available"
+            $patterns += "(?i)network\s+resource\s+.*unavailable"
+
+            foreach ($pattern in $patterns) {
+                $match = Select-String -LiteralPath $path -Pattern $pattern -SimpleMatch:$false -ErrorAction SilentlyContinue | Select-Object -First 1
+
+                if ($match) {
+                    Write-Log "Detected Dell Command Update MSI source/removal error marker in $path`: $($match.Line.Trim())" "WARN"
+                    return $true
+                }
+            }
+        }
+        catch {
+            Write-Log "Could not inspect log file for Dell MSI source errors: $path. Error: $($_.Exception.Message)" "WARN"
+        }
+    }
+
+    return $false
+}
+
+function ConvertTo-MsiPackedGuid {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Guid
+    )
+
+    $clean = $Guid.Trim().Trim([char[]]"{}").ToUpperInvariant()
+
+    if ($clean -notmatch "^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$") {
+        return ""
+    }
+
+    $parts = $clean.Split("-")
+
+    function Reverse-StringLocal {
+        param([string]$Value)
+        $chars = $Value.ToCharArray()
+        [array]::Reverse($chars)
+        return (-join $chars)
+    }
+
+    function Reverse-PairsLocal {
+        param([string]$Value)
+        $result = New-Object System.Text.StringBuilder
+
+        for ($i = 0; $i -lt $Value.Length; $i += 2) {
+            if (($i + 1) -lt $Value.Length) {
+                [void]$result.Append($Value[$i + 1])
+                [void]$result.Append($Value[$i])
+            }
+            else {
+                [void]$result.Append($Value[$i])
+            }
+        }
+
+        return $result.ToString()
+    }
+
+    return ((Reverse-StringLocal $parts[0]) + (Reverse-StringLocal $parts[1]) + (Reverse-StringLocal $parts[2]) + (Reverse-PairsLocal $parts[3]) + (Reverse-PairsLocal $parts[4]))
+}
+
+function Export-RegistryKeyIfPresent {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$NativeKeyPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$BackupFolder,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Label
+    )
+
+    $safeLabel = $Label -replace "[^\w.-]", "_"
+    $backupFile = Join-Path $BackupFolder "$safeLabel.reg"
+
+    try {
+        & reg.exe query $NativeKeyPath *> $null
+
+        if ($LASTEXITCODE -ne 0) {
+            return $false
+        }
+
+        & reg.exe export $NativeKeyPath $backupFile /y *> $null
+
+        if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $backupFile)) {
+            Write-Log "Backed up registry key $NativeKeyPath to $backupFile"
+            return $true
+        }
+
+        Write-Log "Could not export registry key $NativeKeyPath before removal." "WARN"
+        return $false
+    }
+    catch {
+        Write-Log "Could not back up registry key $NativeKeyPath`: $($_.Exception.Message)" "WARN"
+        return $false
+    }
+}
+
+function Remove-RegistryKeyIfPresent {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$NativeKeyPath
+    )
+
+    $psPath = "Registry::$NativeKeyPath"
+
+    try {
+        if (Test-Path -LiteralPath $psPath) {
+            Remove-Item -LiteralPath $psPath -Recurse -Force -ErrorAction Stop
+            Write-Log "Removed registry key: $NativeKeyPath" "WARN"
+            return $true
+        }
+    }
+    catch {
+        Write-Log "Could not remove registry key $NativeKeyPath`: $($_.Exception.Message)" "WARN"
+    }
+
+    return $false
+}
+
+function Invoke-DellCommandUpdateMsiSourceErrorCleanup {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$BackupFolder
+    )
+
+    if (-not $DellCommandUpdateEnableMsiSourceErrorRegistryCleanup) {
+        Write-Log "Dell MSI source-error registry cleanup is disabled." "WARN"
+        return $false
+    }
+
+    $apps = @(Get-DellCommandUpdateInstalledApp)
+
+    if ($apps.Count -eq 0) {
+        Write-Log "No Dell Command Update uninstall/MSI registry entries were found for MSI source-error cleanup." "WARN"
+        return $false
+    }
+
+    New-Item -ItemType Directory -Path $BackupFolder -Force | Out-Null
+
+    $removedAny = $false
+
+    foreach ($app in $apps) {
+        $guid = $null
+
+        if ($app.RegistryKeyName -match "^\{[0-9A-Fa-f-]{36}\}$") {
+            $guid = $app.RegistryKeyName.ToUpperInvariant()
+        }
+        elseif ($app.UninstallString -match "\{[0-9A-Fa-f-]{36}\}") {
+            $guid = $Matches[0].ToUpperInvariant()
+        }
+
+        Write-Log "Evaluating Dell Command Update stale MSI registration cleanup candidate: $($app.DisplayName) $($app.DisplayVersion) [$($app.RegistryView)] ProductCode=$guid" "WARN"
+
+        if (-not $guid) {
+            Write-Log "Skipping stale MSI cleanup for $($app.DisplayName) because no MSI product code was found." "WARN"
+            continue
+        }
+
+        $uninstallNativePath = $null
+
+        if ($app.RegistryView -eq "Registry32") {
+            $uninstallNativePath = "HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\$($app.RegistryKeyName)"
+        }
+        else {
+            $uninstallNativePath = "HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\$($app.RegistryKeyName)"
+        }
+
+        [void](Export-RegistryKeyIfPresent -NativeKeyPath $uninstallNativePath -BackupFolder $BackupFolder -Label "Uninstall_$($app.RegistryView)_$guid")
+
+        if (Remove-RegistryKeyIfPresent -NativeKeyPath $uninstallNativePath) {
+            $removedAny = $true
+        }
+
+        $packedGuid = ConvertTo-MsiPackedGuid -Guid $guid
+
+        if ($packedGuid) {
+            $installerProductPaths = @(
+                "HKEY_LOCAL_MACHINE\SOFTWARE\Classes\Installer\Products\$packedGuid",
+                "HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\S-1-5-18\Products\$packedGuid"
+            )
+
+            foreach ($installerProductPath in $installerProductPaths) {
+                [void](Export-RegistryKeyIfPresent -NativeKeyPath $installerProductPath -BackupFolder $BackupFolder -Label "InstallerProduct_$packedGuid")
+
+                if (Remove-RegistryKeyIfPresent -NativeKeyPath $installerProductPath) {
+                    $removedAny = $true
+                }
+            }
+        }
+    }
+
+    if ($removedAny) {
+        Write-Log "Dell Command Update stale MSI registration cleanup completed. Backups are in: $BackupFolder" "WARN"
+        return $true
+    }
+
+    Write-Log "Dell Command Update stale MSI registration cleanup did not remove any keys." "WARN"
+    return $false
+}
+
 function Install-DellCommandUpdateWithChocolatey {
     param(
         [string]$PackageId = $ChocolateyDellCommandUpdatePackageId,
@@ -2235,10 +2604,10 @@ function Install-DellCommandUpdateWithChocolatey {
         }
     }
 
-    $choco = Find-ChocolateyExecutable
+    $choco = Ensure-ChocolateyInstalled
 
     if (-not $choco) {
-        Write-Log "choco.exe was not found. Cannot use Chocolatey fallback for Dell Command Update." "WARN"
+        Write-Log "choco.exe is still unavailable. Cannot use Chocolatey fallback for Dell Command Update." "WARN"
         return $false
     }
 
@@ -2299,6 +2668,10 @@ function Install-DellCommandUpdate {
         [bool]$AllowChocolateyFallback = $true
     )
 
+    $script:LastDellCommandUpdateInstallerExitCode = $null
+    $script:LastDellCommandUpdateInstallerLog = ""
+    $script:LastDellCommandUpdateInstallerHadMsiSourceError = $false
+
     $dotNetReady = Install-DotNetDesktopRuntime8 -DownloadFolder $DownloadFolder
 
     if (-not $dotNetReady) {
@@ -2316,6 +2689,7 @@ function Install-DellCommandUpdate {
 
     if ($dcuInstaller -and (Test-Path -LiteralPath $dcuInstaller)) {
         $dcuInstallLog = Join-Path $DownloadFolder "Dell-Command-Update-Install.log"
+        $script:LastDellCommandUpdateInstallerLog = $dcuInstallLog
 
         Write-Log "Installing Dell Command Update silently."
 
@@ -2326,9 +2700,19 @@ function Install-DellCommandUpdate {
             -SuccessExitCodes @(0) `
             -RebootExitCodes @(2, 3010)
 
+        if ($dcuInstallResult) {
+            $script:LastDellCommandUpdateInstallerExitCode = $dcuInstallResult.ExitCode
+        }
+
         if ($dcuInstallResult.Success) {
             Start-Sleep -Seconds 20
             return $true
+        }
+
+        $script:LastDellCommandUpdateInstallerHadMsiSourceError = Test-LogContainsDellMsiSourceError -Paths @($dcuInstallLog)
+
+        if ($script:LastDellCommandUpdateInstallerHadMsiSourceError) {
+            Write-Log "Dell Command Update installer appears to have hit MSI 1612/1714-style source/removal errors." "WARN"
         }
 
         Write-Log "Dell Command Update installer ran but did not report success." "WARN"
@@ -2341,7 +2725,7 @@ function Install-DellCommandUpdate {
         return (Install-DellCommandUpdateWithChocolatey)
     }
 
-    Write-Log "Dell Command Update install cannot continue without a downloaded installer." "ERROR"
+    Write-Log "Dell Command Update install cannot continue without a downloaded installer or the installer did not succeed." "ERROR"
     $global:HadVendorFailure = $true
     return $false
 }
