@@ -42,14 +42,25 @@ $RestartDellClientManagementServiceOnServiceError = $true
 $DellClientManagementServiceForceStop = $true
 $DellClientManagementServiceWaitTimeoutSeconds = 90
 $DellClientManagementServicePostStartDelaySeconds = 20
-$DellDcuServiceRecoveryExitCodes = @(3000, 3002, 3003, 3004, 3005)
+$DellDcuServiceRecoveryExitCodes = @(3000, 3001, 3002, 3003, 3004, 3005)
+$DellDcuServiceRestartRecoveryExitCodes = @(3000, 3001, 3002)
+$DellDcuServiceBusyExitCodes = @(3003, 3004, 3005)
 $DellDcuServiceRecoveryRetries = 1
+$DellDcuServiceBusyWaitMinutes = 30
+$DellDcuServiceBusyPollSeconds = 60
+# Dell documents 3003/3004/3005 as wait states, not proof that DCU is corrupt.
+# Keep this false for RMM runs where avoiding unnecessary reboot debt is more important than forcing repair.
+$DellDcuTreatPersistentServiceBusyAsRebootRequired = $false
+$DellDcuRepairPersistentBusyAfterWait = $false
 
-# Dell Command Update repair path for persistent service-busy state.
-# Default is intentionally conservative: try Chocolatey forced upgrade/repair first, then Dell EXE in-place repair.
+# Avoid compounding a pending reboot. If Windows already has a pending reboot marker, skip Dell install/apply.
+$SkipDellCommandUpdateWhenWindowsPendingReboot = $true
+
+# Dell Command Update repair path for persistent service state problems.
+# Default is intentionally conservative: do not repair on 3003/3004/3005 because Dell documents those as busy/pending-update states.
 # Avoid uninstall/reinstall by default because failed MSI removal can leave DCU in a broken 1714/1612 state.
-$RepairDellCommandUpdateOnPersistentServiceBusy = $true
-$DellCommandUpdateRepairOnExitCodes = @(3005)
+$RepairDellCommandUpdateOnPersistentServiceBusy = $false
+$DellCommandUpdateRepairOnExitCodes = @()
 $DellCommandUpdateRepairRetriesPerRun = 1
 $DellCommandUpdateUninstallTimeoutMinutes = 15
 $DellCommandUpdateRepairPostInstallDelaySeconds = 30
@@ -146,6 +157,9 @@ $global:DellToolBootstrapped = $false
 $global:DellClientManagementServiceRecovered = $false
 $global:DellCommandUpdateRepairAttempted = $false
 $global:DellCommandUpdateRepairSucceeded = $false
+$global:DellCommandUpdateRepairRequiresReboot = $false
+$global:DellServiceBusyDeferral = $false
+$global:WindowsPendingRebootDetected = $false
 $global:DellStopFurtherApplyAttempts = $false
 $script:LastDellCommandUpdateInstallerExitCode = $null
 $script:LastDellCommandUpdateInstallerLog = ""
@@ -791,6 +805,55 @@ function Restart-DellClientManagementService {
     }
 }
 
+function Test-PendingReboot {
+    $reasons = New-Object System.Collections.Generic.List[string]
+
+    $rebootKeys = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending",
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootInProgress",
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired",
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\PostRebootReporting",
+        "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\PendingFileRenameOperations"
+    )
+
+    foreach ($keyPath in $rebootKeys) {
+        try {
+            if (Test-Path -LiteralPath $keyPath) {
+                [void]$reasons.Add($keyPath)
+            }
+        }
+        catch {}
+    }
+
+    try {
+        $sessionManager = Get-ItemProperty -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager" -ErrorAction SilentlyContinue
+
+        if ($sessionManager -and $sessionManager.PendingFileRenameOperations) {
+            [void]$reasons.Add("HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\PendingFileRenameOperations value")
+        }
+    }
+    catch {}
+
+    try {
+        $ccm = Invoke-CimMethod -Namespace "root\ccm\ClientSDK" -ClassName "CCM_ClientUtilities" -MethodName "DetermineIfRebootPending" -ErrorAction Stop
+
+        if ($ccm -and (($ccm.RebootPending -eq $true) -or ($ccm.IsHardRebootPending -eq $true))) {
+            [void]$reasons.Add("ConfigMgr ClientSDK reboot pending")
+        }
+    }
+    catch {}
+
+    $uniqueReasons = @($reasons | Sort-Object -Unique)
+
+    if ($uniqueReasons.Count -gt 0) {
+        Write-Log "Windows pending reboot indicators detected: $($uniqueReasons -join '; ')" "WARN"
+        return $true
+    }
+
+    Write-Log "No Windows pending reboot indicators were detected by the built-in checks."
+    return $false
+}
+
 function Test-IsDellCommandUpdateDisplayName {
     param(
         [string]$DisplayName
@@ -1029,6 +1092,12 @@ function Repair-DellCommandUpdate {
                 -WaitTimeoutSeconds $DellClientManagementServiceWaitTimeoutSeconds `
                 -PostStartDelaySeconds $DellClientManagementServicePostStartDelaySeconds)
 
+            if ($script:LastDellCommandUpdateChocolateyRequiresReboot) {
+                Write-Log "Chocolatey Dell Command Update repair completed and reported reboot required. DCU apply will be deferred until after reboot." "WARN"
+                $global:DellCommandUpdateRepairRequiresReboot = $true
+                $global:RebootRequired = $true
+            }
+
             $global:DellCommandUpdateRepairSucceeded = $true
             return $true
         }
@@ -1138,6 +1207,12 @@ function Repair-DellCommandUpdate {
 
     Write-Log "Dell Command Update repair/install completed. New CLI path: $newCli"
 
+    if ($script:LastDellCommandUpdateInstallerRequiresReboot) {
+        Write-Log "Dell Command Update installer reported reboot required during repair. DCU apply will be deferred until after reboot." "WARN"
+        $global:DellCommandUpdateRepairRequiresReboot = $true
+        $global:RebootRequired = $true
+    }
+
     [void](Restart-DellClientManagementService `
         -ForceStop $DellClientManagementServiceForceStop `
         -WaitTimeoutSeconds $DellClientManagementServiceWaitTimeoutSeconds `
@@ -1172,6 +1247,9 @@ function Invoke-DellCommandUpdateApplyWithServiceRecovery {
     $effectiveDellCli = $DellCli
     $serviceRetryAttempt = 0
     $repairRetryAttempt = 0
+    $busyWaitAttempt = 0
+    $busyWaitStarted = $null
+    $busyWaitDeadline = $null
     $result = $null
 
     if ($RestartDellClientManagementServiceBeforeDellApply -and -not $script:DellClientManagementServiceRestartedThisRun) {
@@ -1193,8 +1271,8 @@ function Invoke-DellCommandUpdateApplyWithServiceRecovery {
                 FilePath = $effectiveDellCli
                 ExitCode = $null
                 Ran = $false
-                Success = $false
-                Status = "SkippedAfterPriorDellFailure"
+                Success = $true
+                Status = "SkippedAfterPriorDellDeferral"
             }
         }
 
@@ -1204,6 +1282,10 @@ function Invoke-DellCommandUpdateApplyWithServiceRecovery {
 
         if ($repairRetryAttempt -gt 0) {
             Write-Log "$displayName post-repair retry attempt $repairRetryAttempt." "WARN"
+        }
+
+        if ($busyWaitAttempt -gt 0) {
+            Write-Log "$displayName Dell service-busy wait retry attempt $busyWaitAttempt." "WARN"
         }
 
         $result = Invoke-LoggedProcess `
@@ -1223,7 +1305,63 @@ function Invoke-DellCommandUpdateApplyWithServiceRecovery {
             return $result
         }
 
-        if ($RestartDellClientManagementServiceOnServiceError -and $serviceRetryAttempt -lt $DellDcuServiceRecoveryRetries) {
+        if ($DellDcuServiceBusyExitCodes -contains $result.ExitCode) {
+            if (-not $busyWaitStarted) {
+                $busyWaitStarted = Get-Date
+                $busyWaitDeadline = $busyWaitStarted.AddMinutes($DellDcuServiceBusyWaitMinutes)
+                Write-Log "$displayName returned Dell service-busy/pending-update exit code $($result.ExitCode). Dell documents this as a wait condition, so repair/reinstall is not attempted by default." "WARN"
+            }
+
+            if ((Get-Date) -lt $busyWaitDeadline -and $DellDcuServiceBusyWaitMinutes -gt 0) {
+                $busyWaitAttempt++
+                Write-Log "Waiting $DellDcuServiceBusyPollSeconds seconds before retrying $displayName because Dell Client Management Service is busy or installing pending updates." "WARN"
+                Start-Sleep -Seconds $DellDcuServiceBusyPollSeconds
+                continue
+            }
+
+            Write-Log "$displayName still returned Dell service-busy/pending-update exit code $($result.ExitCode) after waiting up to $DellDcuServiceBusyWaitMinutes minutes." "WARN"
+
+            if (-not $DellDcuRepairPersistentBusyAfterWait) {
+                if ($DellDcuTreatPersistentServiceBusyAsRebootRequired) {
+                    Write-Log "Treating persistent Dell service-busy state as pending Dell work/reboot-required and deferring further Dell apply attempts. The script will not restart the endpoint." "WARN"
+                    $global:RebootRequired = $true
+                    $global:HadVendorWarning = $true
+                    $global:DellServiceBusyDeferral = $true
+                    $global:DellStopFurtherApplyAttempts = $true
+
+                    return [pscustomobject]@{
+                        Tool = $displayName
+                        FilePath = $effectiveDellCli
+                        ExitCode = $result.ExitCode
+                        Ran = $true
+                        Success = $true
+                        Status = "PendingDellServiceWorkOrRebootRequired"
+                    }
+                }
+
+                Write-Log "Persistent Dell service-busy state will be reported as a warning deferral instead of a repair or reboot-required failure." "WARN"
+                $global:HadVendorWarning = $true
+                $global:DellServiceBusyDeferral = $true
+                $global:DellStopFurtherApplyAttempts = $true
+
+                return [pscustomobject]@{
+                    Tool = $displayName
+                    FilePath = $effectiveDellCli
+                    ExitCode = $result.ExitCode
+                    Ran = $true
+                    Success = $true
+                    Status = "PendingDellServiceWork"
+                }
+            }
+
+            Write-Log "DellDcuRepairPersistentBusyAfterWait is enabled. Proceeding to configured repair path after persistent service-busy state." "WARN"
+        }
+
+        if (
+            $RestartDellClientManagementServiceOnServiceError -and
+            ($DellDcuServiceRestartRecoveryExitCodes -contains $result.ExitCode) -and
+            $serviceRetryAttempt -lt $DellDcuServiceRecoveryRetries
+        ) {
             Write-Log "$displayName returned Dell service-related exit code $($result.ExitCode). Restarting Dell Client Management Service and retrying." "WARN"
 
             [void](Restart-DellClientManagementService `
@@ -1241,7 +1379,7 @@ function Invoke-DellCommandUpdateApplyWithServiceRecovery {
             ($repairRetryAttempt -lt $DellCommandUpdateRepairRetriesPerRun) -and
             (-not $global:DellCommandUpdateRepairAttempted)
         ) {
-            Write-Log "$displayName returned persistent Dell service-busy exit code $($result.ExitCode) after service recovery. Starting Dell Command Update repair/reinstall." "WARN"
+            Write-Log "$displayName returned Dell service-related exit code $($result.ExitCode) after recovery. Starting Dell Command Update repair path." "WARN"
 
             $repairDir = Join-Path $RunLogDir "DellCommandUpdateRepair"
             $repairSucceeded = Repair-DellCommandUpdate -DownloadFolder $repairDir
@@ -1256,11 +1394,37 @@ function Invoke-DellCommandUpdateApplyWithServiceRecovery {
                     return $result
                 }
 
+                if ($global:DellCommandUpdateRepairRequiresReboot) {
+                    $repairExitCode = $script:LastDellCommandUpdateInstallerExitCode
+
+                    if ($null -eq $repairExitCode) {
+                        $repairExitCode = $script:LastDellCommandUpdateChocolateyExitCode
+                    }
+
+                    if ($null -eq $repairExitCode) {
+                        $repairExitCode = $result.ExitCode
+                    }
+
+                    Write-Log "Dell Command Update repair succeeded but reported reboot required. Deferring $displayName until after reboot instead of immediately retrying DCU." "WARN"
+                    $global:RebootRequired = $true
+                    $global:HadVendorWarning = $true
+                    $global:DellStopFurtherApplyAttempts = $true
+
+                    return [pscustomobject]@{
+                        Tool = $displayName
+                        FilePath = $effectiveDellCli
+                        ExitCode = $repairExitCode
+                        Ran = $true
+                        Success = $true
+                        Status = "RebootRequiredAfterDcuRepair"
+                    }
+                }
+
                 $serviceRetryAttempt = 0
                 $repairRetryAttempt++
                 $script:DellClientManagementServiceRestartedThisRun = $true
 
-                Write-Log "Retrying $displayName after Dell Command Update repair/reinstall." "WARN"
+                Write-Log "Retrying $displayName after Dell Command Update repair." "WARN"
                 continue
             }
             else {
@@ -1268,6 +1432,22 @@ function Invoke-DellCommandUpdateApplyWithServiceRecovery {
                 $global:HadVendorFailure = $true
                 $global:DellStopFurtherApplyAttempts = $true
                 return $result
+            }
+        }
+
+        if (-not $RepairDellCommandUpdateOnPersistentServiceBusy -and ($DellDcuServiceRecoveryExitCodes -contains $result.ExitCode)) {
+            Write-Log "$displayName returned Dell service-related exit code $($result.ExitCode), but Dell Command Update repair is disabled by policy to avoid creating reboot-required/staged MSI state. Deferring Dell work as a warning." "WARN"
+            $global:HadVendorWarning = $true
+            $global:DellServiceBusyDeferral = $true
+            $global:DellStopFurtherApplyAttempts = $true
+
+            return [pscustomobject]@{
+                Tool = $displayName
+                FilePath = $effectiveDellCli
+                ExitCode = $result.ExitCode
+                Ran = $true
+                Success = $true
+                Status = "DellServiceUnavailableRepairDisabled"
             }
         }
 
@@ -2590,6 +2770,8 @@ function Install-DellCommandUpdateWithChocolatey {
     )
 
     $isRepairMode = [bool]$Force
+    $script:LastDellCommandUpdateChocolateyExitCode = $null
+    $script:LastDellCommandUpdateChocolateyRequiresReboot = $false
 
     if ($isRepairMode) {
         if (-not $UseChocolateyFallbackForDellCommandUpdateRepair) {
@@ -2638,7 +2820,16 @@ function Install-DellCommandUpdateWithChocolatey {
         -FilePath $choco `
         -Arguments $args `
         -SuccessExitCodes @(0) `
-        -RebootExitCodes @(3010, 1641)
+        -RebootExitCodes @(3010, 1641) `
+        -NonFatalUnexpectedExitCodes @(1, 2, 3, 4, 5, 6, 7, 8, 9)
+
+    if ($chocoResult) {
+        $script:LastDellCommandUpdateChocolateyExitCode = $chocoResult.ExitCode
+
+        if ($chocoResult.Status -eq "RebootRequired") {
+            $script:LastDellCommandUpdateChocolateyRequiresReboot = $true
+        }
+    }
 
     if ($chocoResult.Success) {
         Start-Sleep -Seconds 20
@@ -2671,6 +2862,7 @@ function Install-DellCommandUpdate {
     $script:LastDellCommandUpdateInstallerExitCode = $null
     $script:LastDellCommandUpdateInstallerLog = ""
     $script:LastDellCommandUpdateInstallerHadMsiSourceError = $false
+    $script:LastDellCommandUpdateInstallerRequiresReboot = $false
 
     $dotNetReady = Install-DotNetDesktopRuntime8 -DownloadFolder $DownloadFolder
 
@@ -2702,6 +2894,10 @@ function Install-DellCommandUpdate {
 
         if ($dcuInstallResult) {
             $script:LastDellCommandUpdateInstallerExitCode = $dcuInstallResult.ExitCode
+
+            if ($dcuInstallResult.Status -eq "RebootRequired") {
+                $script:LastDellCommandUpdateInstallerRequiresReboot = $true
+            }
         }
 
         if ($dcuInstallResult.Success) {
@@ -2932,12 +3128,23 @@ try {
     $installedApps = Get-InstalledAppNames
     $results = @()
 
+    if ($SkipDellCommandUpdateWhenWindowsPendingReboot) {
+        $global:WindowsPendingRebootDetected = Test-PendingReboot
+
+        if ($global:WindowsPendingRebootDetected) {
+            Write-Log "SkipDellCommandUpdateWhenWindowsPendingReboot is enabled. Dell Command Update install/apply will be skipped to avoid adding more staged work before the reboot is cleared." "WARN"
+            $global:RebootRequired = $true
+            $global:HadVendorWarning = $true
+            $global:DellStopFurtherApplyAttempts = $true
+        }
+    }
+
     # -----------------------------
     # Dell Command Update
     # -----------------------------
     $dellCli = Find-DellCommandUpdateCli
 
-    if (-not $dellCli -and $system.Manufacturer -match "Dell" -and $InstallDellCommandUpdateIfMissing) {
+    if (-not $global:DellStopFurtherApplyAttempts -and -not $dellCli -and $system.Manufacturer -match "Dell" -and $InstallDellCommandUpdateIfMissing) {
         Write-Log "Dell system detected, but dcu-cli.exe was not found. InstallDellCommandUpdateIfMissing is enabled."
 
         $bootstrapDir = Join-Path $RunLogDir "Bootstrap"
@@ -2948,7 +3155,18 @@ try {
         if ($installedDcu) {
             $global:DellToolBootstrapped = $true
             $dellCli = Find-DellCommandUpdateCli
+
+            if ($script:LastDellCommandUpdateInstallerRequiresReboot -or $script:LastDellCommandUpdateChocolateyRequiresReboot) {
+                Write-Log "Dell Command Update was installed, but the installer reported reboot required. Deferring Dell apply until after reboot." "WARN"
+                $global:RebootRequired = $true
+                $global:DellStopFurtherApplyAttempts = $true
+            }
         }
+    }
+
+    if ($global:DellStopFurtherApplyAttempts -and $system.Manufacturer -match "Dell" -and -not $dellCli) {
+        Write-Log "Dell system detected, but Dell Command Update was not installed or run because DellStopFurtherApplyAttempts=True. This is expected when a pending reboot was detected." "WARN"
+        $global:SupportedToolFound = $true
     }
 
     if ($dellCli) {
@@ -3298,6 +3516,9 @@ try {
     Write-Log "Dell Client Management Service recovered/restarted: $global:DellClientManagementServiceRecovered"
     Write-Log "Dell Command Update repair attempted: $global:DellCommandUpdateRepairAttempted"
     Write-Log "Dell Command Update repair succeeded: $global:DellCommandUpdateRepairSucceeded"
+    Write-Log "Dell Command Update repair requires reboot: $global:DellCommandUpdateRepairRequiresReboot"
+    Write-Log "Dell service-busy deferral: $global:DellServiceBusyDeferral"
+    Write-Log "Windows pending reboot detected: $global:WindowsPendingRebootDetected"
     Write-Log "Dell stop further apply attempts: $global:DellStopFurtherApplyAttempts"
 
     Write-Log "Lenovo tool found: $global:LenovoToolFound"
@@ -3342,6 +3563,9 @@ try {
     Write-Output "OEMUPDATER_DELL_CLIENT_MANAGEMENT_SERVICE_RECOVERED=$global:DellClientManagementServiceRecovered"
     Write-Output "OEMUPDATER_DELL_COMMAND_UPDATE_REPAIR_ATTEMPTED=$global:DellCommandUpdateRepairAttempted"
     Write-Output "OEMUPDATER_DELL_COMMAND_UPDATE_REPAIR_SUCCEEDED=$global:DellCommandUpdateRepairSucceeded"
+    Write-Output "OEMUPDATER_DELL_COMMAND_UPDATE_REPAIR_REQUIRES_REBOOT=$global:DellCommandUpdateRepairRequiresReboot"
+    Write-Output "OEMUPDATER_DELL_SERVICE_BUSY_DEFERRAL=$global:DellServiceBusyDeferral"
+    Write-Output "OEMUPDATER_WINDOWS_PENDING_REBOOT_DETECTED=$global:WindowsPendingRebootDetected"
     Write-Output "OEMUPDATER_DELL_STOP_FURTHER_APPLY_ATTEMPTS=$global:DellStopFurtherApplyAttempts"
 
     Write-Output "OEMUPDATER_LENOVO_TOOL_FOUND=$global:LenovoToolFound"
