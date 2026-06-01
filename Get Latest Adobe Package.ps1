@@ -38,7 +38,9 @@ $AdobeTargetVersion = "26.001.21563"
 # The script will try these in order.
 $AdobeDownloadBaseUrls = @(
     "https://ardownload3.adobe.com/pub/adobe/acrobat/win/AcrobatDC",
-    "https://ardownload2.adobe.com/pub/adobe/acrobat/win/AcrobatDC"
+    "https://ardownload3.adobe.com/pub/adobe/reader/win/AcrobatDC",
+    "https://ardownload2.adobe.com/pub/adobe/acrobat/win/AcrobatDC",
+    "https://ardownload2.adobe.com/pub/adobe/reader/win/AcrobatDC"
 )
 
 # Reader MUI detection is not always obvious from registry.
