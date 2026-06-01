@@ -1,7 +1,7 @@
-# Name: Update-AdobeAcrobatAdjacent.ps1
+# Name: Update-AdobeAcrobatAdjacent-ManualVersion.ps1
 # Description:
 #   Detects Adobe Acrobat / Adobe Acrobat Reader only, determines product and architecture,
-#   downloads the latest matching Continuous Track MSP update from Adobe, and installs it silently.
+#   downloads the manually specified Continuous Track MSP update from Adobe, and installs it silently.
 #
 # Designed for ConnectWise RMM execution as System/elevated PowerShell.
 #
@@ -12,10 +12,9 @@
 #   - It does NOT reopen Adobe helper processes afterward.
 #   - It does NOT require launch flags.
 #
-# Timeout behavior:
-#   - Adobe web requests have timeout/retry handling.
-#   - If Adobe release notes time out, script uses a fallback version and direct MSP URLs.
-#   - MSI installer execution has a maximum wait time.
+# Version behavior:
+#   - No Adobe release-note scraping.
+#   - Set the desired Adobe version manually in $AdobeTargetVersion.
 #
 # Cleanup behavior:
 #   - Downloaded MSP patch files are removed after successful installation.
@@ -30,6 +29,17 @@ $ProgressPreference = "SilentlyContinue"
 # =========================
 
 $WorkingDirectory = "C:\ProgramData\AdobeAcrobatUpdate"
+
+# Manually set the Adobe Acrobat / Reader Continuous Track version here.
+# Format must be ##.###.##### such as 26.001.21563
+$AdobeTargetVersion = "26.001.21563"
+
+# Adobe direct download hosts.
+# The script will try these in order.
+$AdobeDownloadBaseUrls = @(
+    "https://ardownload3.adobe.com/pub/adobe/acrobat/win/AcrobatDC",
+    "https://ardownload2.adobe.com/pub/adobe/acrobat/win/AcrobatDC"
+)
 
 # Reader MUI detection is not always obvious from registry.
 # AutoTryBoth tries the likely Reader MSP first, then tries the alternate
@@ -55,18 +65,9 @@ $WebRequestRetryDelaySeconds = 10
 # Installer timeout.
 $InstallerTimeoutMinutes = 45
 
-# Adobe release notes source.
-$ReleaseNotesIndexUrl = "https://www.adobe.com/devnet-docs/acrobatetk/tools/ReleaseNotesDC/index.html"
-
-# Fallback values.
-# Update these when Adobe publishes a newer Continuous Track release.
-$FallbackAdobeVersion = "26.001.21563"
-$FallbackAdobeReleaseUrl = "https://www.adobe.com/devnet-docs/acrobatetk/tools/ReleaseNotesDC/continuous/dccontinuousapr2026qfe2.html"
-$DirectAdobeDownloadBaseUrl = "https://ardownload3.adobe.com/pub/adobe/acrobat/win/AcrobatDC"
-
 $AdobeWebHeaders = @{
     "User-Agent" = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
-    "Accept"     = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    "Accept"     = "*/*"
 }
 
 try {
@@ -91,49 +92,58 @@ function Write-Log {
     Add-Content -Path $LogFile -Value $line
 }
 
+function Test-AdobeVersionFormat {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Version
+    )
+
+    return $Version -match "^\d{2}\.\d{3}\.\d{5}$"
+}
+
 function Invoke-AdobeWebRequest {
     param(
         [Parameter(Mandatory = $true)]
         [string]$Uri,
 
+        [Parameter(Mandatory = $true)]
         [string]$OutFile
     )
 
     for ($attempt = 1; $attempt -le $WebRequestRetries; $attempt++) {
         try {
-            Write-Log ("Web request attempt {0} of {1}: {2}" -f $attempt, $WebRequestRetries, $Uri)
+            Write-Log ("Web download attempt {0} of {1}: {2}" -f $attempt, $WebRequestRetries, $Uri)
 
-            if ([string]::IsNullOrWhiteSpace($OutFile)) {
-                return Invoke-WebRequest `
-                    -UseBasicParsing `
-                    -Uri $Uri `
-                    -Headers $AdobeWebHeaders `
-                    -TimeoutSec $WebRequestTimeoutSeconds `
-                    -ErrorAction Stop
-            }
-            else {
-                Invoke-WebRequest `
-                    -UseBasicParsing `
-                    -Uri $Uri `
-                    -Headers $AdobeWebHeaders `
-                    -TimeoutSec $WebRequestTimeoutSeconds `
-                    -OutFile $OutFile `
-                    -ErrorAction Stop
+            Invoke-WebRequest `
+                -UseBasicParsing `
+                -Uri $Uri `
+                -Headers $AdobeWebHeaders `
+                -TimeoutSec $WebRequestTimeoutSeconds `
+                -OutFile $OutFile `
+                -ErrorAction Stop
 
-                return $true
-            }
+            return $true
         }
         catch {
-            Write-Log ("Web request failed on attempt {0} of {1}: {2}" -f $attempt, $WebRequestRetries, $_.Exception.Message)
+            Write-Log ("Web download failed on attempt {0} of {1}: {2}" -f $attempt, $WebRequestRetries, $_.Exception.Message)
+
+            if (Test-Path $OutFile) {
+                try {
+                    Remove-Item -Path $OutFile -Force -ErrorAction SilentlyContinue
+                }
+                catch {
+                    # Ignore cleanup failure for partial download.
+                }
+            }
 
             if ($attempt -lt $WebRequestRetries) {
-                Write-Log "Waiting $WebRequestRetryDelaySeconds second(s) before retrying web request."
+                Write-Log "Waiting $WebRequestRetryDelaySeconds second(s) before retrying web download."
                 Start-Sleep -Seconds $WebRequestRetryDelaySeconds
             }
         }
     }
 
-    throw "Web request failed after $WebRequestRetries attempt(s): $Uri"
+    throw "Web download failed after $WebRequestRetries attempt(s): $Uri"
 }
 
 function Get-PropertyValue {
@@ -152,22 +162,6 @@ function Get-PropertyValue {
     }
 
     return $property.Value
-}
-
-function Resolve-Url {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$BaseUrl,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Href
-    )
-
-    if ($Href -match "^https?://") {
-        return $Href
-    }
-
-    return ([Uri]::new([Uri]$BaseUrl, $Href)).AbsoluteUri
 }
 
 function Compare-VersionSafe {
@@ -374,75 +368,6 @@ function Get-InstalledAdobeAcrobatAdjacentProducts {
         Sort-Object ProductType, Architecture, DisplayName, DisplayVersion -Unique
 }
 
-function Get-LatestAdobeContinuousRelease {
-    Write-Log "Checking Adobe Continuous Track release notes."
-
-    $response = Invoke-AdobeWebRequest -Uri $ReleaseNotesIndexUrl
-    $content = $response.Content
-
-    $matches = [regex]::Matches(
-        $content,
-        '<a\s+[^>]*href="(?<href>continuous/[^"]+)"[^>]*>.*?(?<version>\d{2}\.\d{3}\.\d{5}).*?</a>',
-        [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor
-        [System.Text.RegularExpressions.RegexOptions]::Singleline
-    )
-
-    if ($matches.Count -eq 0) {
-        throw "Could not find Continuous Track release links on Adobe release notes page."
-    }
-
-    $releases = foreach ($match in $matches) {
-        $version = $match.Groups["version"].Value
-        $href = $match.Groups["href"].Value
-
-        [PSCustomObject]@{
-            Version      = $version
-            SortVersion  = [version]$version
-            Url          = Resolve-Url -BaseUrl $ReleaseNotesIndexUrl -Href $href
-            UsedFallback = $false
-        }
-    }
-
-    $latest = $releases |
-        Sort-Object SortVersion -Descending |
-        Select-Object -First 1
-
-    if (-not $latest) {
-        throw "Could not determine latest Adobe Continuous Track version."
-    }
-
-    Write-Log "Latest Adobe Continuous Track version detected: $($latest.Version)"
-    Write-Log "Latest Adobe release page: $($latest.Url)"
-
-    return $latest
-}
-
-function Get-FallbackAdobeContinuousRelease {
-    Write-Log "Using fallback Adobe Continuous Track version: $FallbackAdobeVersion"
-    Write-Log "Fallback release page reference: $FallbackAdobeReleaseUrl"
-
-    return [PSCustomObject]@{
-        Version      = $FallbackAdobeVersion
-        SortVersion  = [version]$FallbackAdobeVersion
-        Url          = $FallbackAdobeReleaseUrl
-        UsedFallback = $true
-    }
-}
-
-function Get-DirectAdobePatchUrl {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Version,
-
-        [Parameter(Mandatory = $true)]
-        [string]$PatchFileName
-    )
-
-    $versionNoDots = $Version.Replace(".", "")
-
-    return "$DirectAdobeDownloadBaseUrl/$versionNoDots/$PatchFileName"
-}
-
 function Get-AcrobatPatchFileName {
     param(
         [Parameter(Mandatory = $true)]
@@ -504,63 +429,61 @@ function Get-ReaderPatchFileNames {
     }
 }
 
-function Get-AdobePatchUrl {
+function Get-DirectAdobePatchUrls {
     param(
         [Parameter(Mandatory = $true)]
-        [object]$Release,
+        [string]$Version,
 
         [Parameter(Mandatory = $true)]
         [string]$PatchFileName
     )
 
-    $directUrl = Get-DirectAdobePatchUrl -Version $Release.Version -PatchFileName $PatchFileName
+    $versionNoDots = $Version.Replace(".", "")
 
-    if ($Release.UsedFallback) {
-        Write-Log "Release notes lookup used fallback. Using direct Adobe download URL: $directUrl"
-        return $directUrl
+    foreach ($baseUrl in $AdobeDownloadBaseUrls) {
+        "$baseUrl/$versionNoDots/$PatchFileName"
     }
+}
 
-    try {
-        Write-Log "Looking for patch file on Adobe release page: $PatchFileName"
+function Download-AdobePatch {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Version,
 
-        $response = Invoke-AdobeWebRequest -Uri $Release.Url
-        $escapedFileName = [regex]::Escape($PatchFileName)
+        [Parameter(Mandatory = $true)]
+        [string]$PatchFileName,
 
+        [Parameter(Mandatory = $true)]
+        [string]$PatchPath
+    )
+
+    $candidateUrls = @(Get-DirectAdobePatchUrls -Version $Version -PatchFileName $PatchFileName)
+
+    foreach ($url in $candidateUrls) {
         try {
-            $link = $response.Links |
-                Where-Object { $_.href -match $escapedFileName } |
-                Select-Object -First 1
+            Write-Log "Trying Adobe direct download URL: $url"
+            Invoke-AdobeWebRequest -Uri $url -OutFile $PatchPath
 
-            if ($link -and $link.href) {
-                $resolvedUrl = Resolve-Url -BaseUrl $Release.Url -Href $link.href
-                Write-Log "Resolved patch URL from release page: $resolvedUrl"
-                return $resolvedUrl
+            if (Test-Path $PatchPath) {
+                Write-Log "Patch downloaded successfully from: $url"
+                return $true
             }
         }
         catch {
-            # Fall through to raw HTML parsing.
+            Write-Log "Download failed from '$url': $($_.Exception.Message)"
+
+            if (Test-Path $PatchPath) {
+                try {
+                    Remove-Item -Path $PatchPath -Force -ErrorAction SilentlyContinue
+                }
+                catch {
+                    # Ignore partial cleanup failure.
+                }
+            }
         }
-
-        $hrefMatch = [regex]::Match(
-            $response.Content,
-            'href="(?<href>[^"]*' + $escapedFileName + '[^"]*)"',
-            [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
-        )
-
-        if ($hrefMatch.Success) {
-            $resolvedUrl = Resolve-Url -BaseUrl $Release.Url -Href $hrefMatch.Groups["href"].Value
-            Write-Log "Resolved patch URL from release page HTML: $resolvedUrl"
-            return $resolvedUrl
-        }
-
-        Write-Log "Could not find patch file '$PatchFileName' on release page. Falling back to direct URL: $directUrl"
-        return $directUrl
     }
-    catch {
-        Write-Log "Could not query Adobe release page for '$PatchFileName': $($_.Exception.Message)"
-        Write-Log "Falling back to direct Adobe download URL: $directUrl"
-        return $directUrl
-    }
+
+    throw "Failed to download patch '$PatchFileName' from all configured Adobe download hosts."
 }
 
 function Install-AdobePatch {
@@ -619,6 +542,13 @@ function Test-MsiSuccessCode {
 try {
     Write-Log "Starting Adobe Acrobat/Reader update process."
 
+    if (-not (Test-AdobeVersionFormat -Version $AdobeTargetVersion)) {
+        throw "AdobeTargetVersion '$AdobeTargetVersion' is not valid. Expected format is ##.###.##### such as 26.001.21563."
+    }
+
+    Write-Log "Manual Adobe target version: $AdobeTargetVersion"
+    Write-Log "No Adobe release-note lookup will be performed."
+
     $products = @(Get-InstalledAdobeAcrobatAdjacentProducts)
 
     if ($products.Count -eq 0) {
@@ -635,8 +565,6 @@ try {
     # =========================
     # Adobe in-use safety check
     # =========================
-    # If Acrobat.exe or AcroRd32.exe is open, skip.
-    # If only helper/background Adobe processes are running, close them before patching.
 
     $AdobeUserAppProcesses = @(
         "Acrobat.exe",
@@ -677,21 +605,6 @@ try {
     }
 
     # =========================
-    # Determine update version
-    # =========================
-
-    try {
-        $latestRelease = Get-LatestAdobeContinuousRelease
-    }
-    catch {
-        Write-Log "Could not retrieve Adobe Continuous Track release notes: $($_.Exception.Message)"
-        Write-Log "Continuing with fallback version instead of failing the script."
-        $latestRelease = Get-FallbackAdobeContinuousRelease
-    }
-
-    $latestVersion = $latestRelease.Version
-
-    # =========================
     # Update process
     # =========================
 
@@ -707,17 +620,17 @@ try {
         }
 
         if (-not [string]::IsNullOrWhiteSpace($product.DisplayVersion)) {
-            $comparison = Compare-VersionSafe -InstalledVersion $product.DisplayVersion -LatestVersion $latestVersion
+            $comparison = Compare-VersionSafe -InstalledVersion $product.DisplayVersion -LatestVersion $AdobeTargetVersion
 
             if ($null -eq $comparison) {
-                Write-Log "Could not compare installed version '$($product.DisplayVersion)' to latest '$latestVersion'. Continuing with update attempt."
+                Write-Log "Could not compare installed version '$($product.DisplayVersion)' to target '$AdobeTargetVersion'. Continuing with update attempt."
             }
             elseif ($comparison -ge 0) {
-                Write-Log "'$($product.DisplayName)' is already current or newer. Installed: $($product.DisplayVersion), latest: $latestVersion."
+                Write-Log "'$($product.DisplayName)' is already current or newer. Installed: $($product.DisplayVersion), target: $AdobeTargetVersion."
                 continue
             }
             else {
-                Write-Log "'$($product.DisplayName)' requires update. Installed: $($product.DisplayVersion), latest: $latestVersion."
+                Write-Log "'$($product.DisplayName)' requires update. Installed: $($product.DisplayVersion), target: $AdobeTargetVersion."
             }
         }
         else {
@@ -726,14 +639,14 @@ try {
 
         if ($product.ProductType -eq "Acrobat") {
             $candidatePatchFiles = @(
-                Get-AcrobatPatchFileName -Architecture $product.Architecture -Version $latestVersion
+                Get-AcrobatPatchFileName -Architecture $product.Architecture -Version $AdobeTargetVersion
             )
         }
         else {
             $candidatePatchFiles = @(
                 Get-ReaderPatchFileNames `
                     -Architecture $product.Architecture `
-                    -Version $latestVersion `
+                    -Version $AdobeTargetVersion `
                     -DetectedMUI ([bool]$product.IsMUI)
             )
         }
@@ -744,12 +657,13 @@ try {
         foreach ($patchFileName in $candidatePatchFiles) {
             Write-Log "Trying patch candidate for '$($product.DisplayName)': $patchFileName"
 
-            $patchUrl = Get-AdobePatchUrl -Release $latestRelease -PatchFileName $patchFileName
             $patchPath = Join-Path $WorkingDirectory $patchFileName
 
             try {
-                Write-Log "Downloading patch: $patchUrl"
-                Invoke-AdobeWebRequest -Uri $patchUrl -OutFile $patchPath
+                Download-AdobePatch `
+                    -Version $AdobeTargetVersion `
+                    -PatchFileName $patchFileName `
+                    -PatchPath $patchPath
             }
             catch {
                 Write-Log "Failed to download patch '$patchFileName': $($_.Exception.Message)"
@@ -763,7 +677,7 @@ try {
                 continue
             }
 
-            Write-Log "Patch downloaded successfully: $patchPath"
+            Write-Log "Patch ready for installation: $patchPath"
 
             if ($DownloadOnly) {
                 Write-Log "DownloadOnly is enabled. Skipping installation and leaving patch file in place: $patchPath"
