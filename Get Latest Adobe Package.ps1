@@ -6,9 +6,16 @@
 # Designed for ConnectWise RMM execution as System/elevated PowerShell.
 #
 # Default safety behavior:
-#   - If Acrobat/Reader appears to be running, the script exits 0 and does NOT update.
-#   - It does NOT close Adobe apps.
+#   - If Acrobat.exe or AcroRd32.exe is open, the script exits 0 and does NOT update.
+#   - If only Adobe background helper processes are running, it closes them before patching.
+#   - It does NOT close Acrobat.exe or AcroRd32.exe.
+#   - It does NOT reopen Adobe helper processes afterward.
 #   - It does NOT require launch flags.
+#
+# Cleanup behavior:
+#   - Downloaded MSP patch files are removed after successful installation.
+#   - Reader MSPs that return "patch not applicable" during MUI/non-MUI fallback are also removed.
+#   - Logs are kept for troubleshooting.
 #
 # Scope:
 #   - Adobe Acrobat Continuous Track
@@ -30,9 +37,6 @@ $ErrorActionPreference = "Stop"
 
 $WorkingDirectory = "C:\ProgramData\AdobeAcrobatUpdate"
 
-# No launch flags needed.
-# If Acrobat/Reader is running, the script safely exits before download/install.
-
 # Reader MUI detection is not always obvious from registry.
 # AutoTryBoth tries the likely Reader MSP first, then tries the alternate
 # Reader MSP only if MSI says the patch is not applicable.
@@ -45,6 +49,10 @@ $ReaderPatchPreference = "AutoTryBoth"
 
 # Set to $true only for testing download logic without installing.
 $DownloadOnly = $false
+
+# Remove downloaded MSP files after successful use.
+# Logs are still retained.
+$CleanupDownloadedPatches = $true
 
 # =========================
 # Adobe release notes source
@@ -122,18 +130,38 @@ function Compare-VersionSafe {
     }
 }
 
-function Get-RunningAdobeUserProcesses {
-    # Conservative by design.
-    # If any of these are running, Acrobat/Reader may have open user documents.
-    $processNames = @(
-        "Acrobat.exe",
-        "AcroRd32.exe",
-        "AcroCEF.exe",
-        "RdrCEF.exe"
+function Remove-DownloadedPatchFile {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$PatchPath
+    )
+
+    if (-not $CleanupDownloadedPatches) {
+        Write-Log "Cleanup is disabled. Leaving downloaded patch file in place: $PatchPath"
+        return
+    }
+
+    if (-not (Test-Path $PatchPath)) {
+        return
+    }
+
+    try {
+        Remove-Item -Path $PatchPath -Force -ErrorAction Stop
+        Write-Log "Removed downloaded patch file: $PatchPath"
+    }
+    catch {
+        Write-Log "Could not remove downloaded patch file '$PatchPath': $($_.Exception.Message)"
+    }
+}
+
+function Get-AdobeProcessesByName {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$ProcessNames
     )
 
     $running = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-        Where-Object { $processNames -contains $_.Name }
+        Where-Object { $ProcessNames -contains $_.Name }
 
     $results = New-Object System.Collections.Generic.List[object]
 
@@ -168,6 +196,23 @@ function Get-RunningAdobeUserProcesses {
     return $results
 }
 
+function Stop-AdobeBackgroundProcesses {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$Processes
+    )
+
+    foreach ($process in $Processes) {
+        try {
+            Write-Log "Closing Adobe background process: $($process.Name) | PID: $($process.ProcessId) | Session: $($process.SessionId) | Owner: $($process.Owner)"
+            Stop-Process -Id $process.ProcessId -Force -ErrorAction Stop
+        }
+        catch {
+            Write-Log "Could not close Adobe background process $($process.Name) PID $($process.ProcessId): $($_.Exception.Message)"
+        }
+    }
+}
+
 function Get-InstalledAdobeAcrobatAdjacentProducts {
     $uninstallRoots = @(
         @{
@@ -194,15 +239,15 @@ function Get-InstalledAdobeAcrobatAdjacentProducts {
 
             # Include Adobe Acrobat / Reader only.
             $isAcrobatFamily =
-                $displayName -match "^(?i)Adobe\s+Acrobat(\s+Reader)?\b" -or
-                $displayName -match "^(?i)Adobe\s+Reader\b"
+                $displayName -match "^Adobe\s+Acrobat(\s+Reader)?\b" -or
+                $displayName -match "^Adobe\s+Reader\b"
 
             if (-not $isAcrobatFamily) {
                 continue
             }
 
             # Exclude adjacent services/components that are not the app itself.
-            if ($displayName -match "(?i)(Update\s+Service|Refresh\s+Manager|Synchronizer|Genuine|ARM|Notification|Collaboration|Core\s+Sync)") {
+            if ($displayName -match "(Update\s+Service|Refresh\s+Manager|Synchronizer|Genuine|ARM|Notification|Collaboration|Core\s+Sync)") {
                 continue
             }
 
@@ -212,22 +257,22 @@ function Get-InstalledAdobeAcrobatAdjacentProducts {
             $uninstallString = Get-PropertyValue -Object $item -Name "UninstallString"
             $psPath          = Get-PropertyValue -Object $item -Name "PSPath"
 
-            if ($publisher -and $publisher -notmatch "(?i)Adobe") {
+            if ($publisher -and $publisher -notmatch "Adobe") {
                 continue
             }
 
             $productType = "Acrobat"
 
-            if ($displayName -match "(?i)Reader" -or $displayName -match "^(?i)Adobe\s+Reader\b") {
+            if ($displayName -match "Reader" -or $displayName -match "^Adobe\s+Reader\b") {
                 $productType = "Reader"
             }
 
             $architecture = $null
 
-            if ($displayName -match "(?i)(64-bit|x64)") {
+            if ($displayName -match "(64-bit|x64)") {
                 $architecture = "x64"
             }
-            elseif ($displayName -match "(?i)(32-bit|x86)") {
+            elseif ($displayName -match "(32-bit|x86)") {
                 $architecture = "x86"
             }
             elseif ($installLocation -match "\(x86\)" -or $uninstallString -match "\(x86\)" -or $psPath -match "WOW6432Node") {
@@ -244,8 +289,8 @@ function Get-InstalledAdobeAcrobatAdjacentProducts {
 
             # Avoid forcing Continuous Track MSPs onto Classic/legacy installs.
             if (
-                $displayName -match "(?i)(Classic|2020|2024|2017|2015| XI\b| X\b)" -or
-                $installLocation -match "(?i)(Acrobat\s+2020|Acrobat\s+2024|Acrobat\s+2017|Acrobat\s+2015|Acrobat\s+XI|Acrobat\s+X)"
+                $displayName -match "(Classic|2020|2024|2017|2015| XI\b| X\b)" -or
+                $installLocation -match "(Acrobat\s+2020|Acrobat\s+2024|Acrobat\s+2017|Acrobat\s+2015|Acrobat\s+XI|Acrobat\s+X)"
             ) {
                 $track = "UnsupportedOrClassic"
             }
@@ -253,9 +298,9 @@ function Get-InstalledAdobeAcrobatAdjacentProducts {
             $isMui = $false
 
             if (
-                $displayName -match "(?i)\bMUI\b" -or
-                $installLocation -match "(?i)\bMUI\b" -or
-                $uninstallString -match "(?i)\bMUI\b"
+                $displayName -match "\bMUI\b" -or
+                $installLocation -match "\bMUI\b" -or
+                $uninstallString -match "\bMUI\b"
             ) {
                 $isMui = $true
             }
@@ -471,19 +516,53 @@ foreach ($product in $products) {
     Write-Log "Detected product: $($product.DisplayName) | Version: $($product.DisplayVersion) | Type: $($product.ProductType) | Arch: $($product.Architecture) | Track: $($product.Track) | MUI detected: $($product.IsMUI)"
 }
 
-# Safety check: do not update while Adobe is running.
-$runningAdobeProcesses = @(Get-RunningAdobeUserProcesses)
+# =========================
+# Adobe in-use safety check
+# =========================
+# If Acrobat.exe or AcroRd32.exe is open, skip.
+# If only helper/background Adobe processes are running, close them before patching.
 
-if ($runningAdobeProcesses.Count -gt 0) {
-    Write-Log "Adobe Acrobat/Reader appears to be in use. Skipping update to avoid closing user documents."
+$AdobeUserAppProcesses = @(
+    "Acrobat.exe",
+    "AcroRd32.exe"
+)
 
-    foreach ($process in $runningAdobeProcesses) {
-        Write-Log "Running Adobe process detected: $($process.Name) | PID: $($process.ProcessId) | Session: $($process.SessionId) | Owner: $($process.Owner)"
+$AdobeBackgroundProcesses = @(
+    "AcroCEF.exe",
+    "RdrCEF.exe",
+    "AdobeCollabSync.exe"
+)
+
+$runningAdobeUserApps = @(Get-AdobeProcessesByName -ProcessNames $AdobeUserAppProcesses)
+
+if ($runningAdobeUserApps.Count -gt 0) {
+    Write-Log "Adobe Acrobat/Reader is actively open. Skipping update to avoid closing user documents."
+
+    foreach ($process in $runningAdobeUserApps) {
+        Write-Log "Open Adobe app detected: $($process.Name) | PID: $($process.ProcessId) | Session: $($process.SessionId) | Owner: $($process.Owner)"
     }
 
     Write-Log "Exiting without installing. ConnectWise can retry on the next scheduled run."
     exit 0
 }
+
+$runningAdobeBackgroundProcesses = @(Get-AdobeProcessesByName -ProcessNames $AdobeBackgroundProcesses)
+
+if ($runningAdobeBackgroundProcesses.Count -gt 0) {
+    Write-Log "No Acrobat/Reader user app is open, but Adobe background helper processes are running."
+    Write-Log "Closing Adobe background helper processes before applying MSP update."
+
+    Stop-AdobeBackgroundProcesses -Processes $runningAdobeBackgroundProcesses
+
+    Start-Sleep -Seconds 3
+}
+else {
+    Write-Log "No active Acrobat/Reader user app or Adobe background helper processes detected."
+}
+
+# =========================
+# Update process
+# =========================
 
 $latestRelease = Get-LatestAdobeContinuousRelease
 $latestVersion = $latestRelease.Version
@@ -567,7 +646,7 @@ foreach ($product in $products) {
         Write-Log "Patch downloaded successfully: $patchPath"
 
         if ($DownloadOnly) {
-            Write-Log "DownloadOnly is enabled. Skipping installation."
+            Write-Log "DownloadOnly is enabled. Skipping installation and leaving patch file in place: $patchPath"
             $productUpdated = $true
             break
         }
@@ -578,6 +657,8 @@ foreach ($product in $products) {
 
             if (Test-MsiSuccessCode -ExitCode $exitCode) {
                 Write-Log "Patch succeeded for '$($product.DisplayName)' using '$patchFileName'."
+                Remove-DownloadedPatchFile -PatchPath $patchPath
+
                 $updatedSomething = $true
                 $productUpdated = $true
                 break
@@ -585,13 +666,16 @@ foreach ($product in $products) {
 
             if ($product.ProductType -eq "Reader" -and $exitCode -eq 1642) {
                 Write-Log "MSI exit code 1642 means this patch is not applicable. For Reader, trying the alternate MUI/non-MUI patch if available."
+                Remove-DownloadedPatchFile -PatchPath $patchPath
                 continue
             }
 
             Write-Log "Patch failed for '$($product.DisplayName)' using '$patchFileName' with exit code $exitCode."
+            Write-Log "Leaving downloaded patch file for troubleshooting: $patchPath"
         }
         catch {
             Write-Log "Exception while installing '$patchFileName': $($_.Exception.Message)"
+            Write-Log "Leaving downloaded patch file for troubleshooting: $patchPath"
             $lastExitCode = 1
         }
     }
