@@ -5,20 +5,20 @@
 #
 # Designed for ConnectWise RMM execution as System/elevated PowerShell.
 #
-# Default safety behavior:
-#   - If Acrobat.exe or AcroRd32.exe is open, the script exits 0 and does NOT update.
+# Important behavior:
+#   - Uses the actual Acrobat.exe / AcroRd32.exe version as the source of truth when available.
+#   - Fixes uninstall registry DisplayVersion for ConnectWise inventory if Adobe is already updated.
+#   - Only runs the MSP if the actual executable version is older than the target.
+#
+# Safety behavior:
+#   - If Acrobat.exe or AcroRd32.exe is open and an update is needed, the script exits 0 and does NOT update.
 #   - If only Adobe background helper processes are running, it closes them before patching.
 #   - It does NOT close Acrobat.exe or AcroRd32.exe.
 #   - It does NOT reopen Adobe helper processes afterward.
-#   - It does NOT require launch flags.
 #
 # Version behavior:
 #   - No Adobe release-note scraping.
 #   - Set the desired Adobe version manually in $AdobeTargetVersion.
-#
-# Inventory behavior:
-#   - After successful MSP installation, updates the product uninstall registry DisplayVersion.
-#   - This helps ConnectWise RMM software inventory report the updated version.
 #
 # Cleanup behavior:
 #   - Downloaded MSP patch files are removed after successful installation.
@@ -63,7 +63,7 @@ $DownloadOnly = $false
 # Remove downloaded MSP files after successful use.
 $CleanupDownloadedPatches = $true
 
-# Update Windows uninstall registry DisplayVersion after successful MSP install.
+# Update Windows uninstall registry DisplayVersion after successful verification/install.
 # This helps ConnectWise RMM software inventory report the patched version.
 $UpdateInventoryDisplayVersion = $true
 
@@ -109,6 +109,49 @@ function Test-AdobeVersionFormat {
     )
 
     return $Version -match "^\d{2}\.\d{3}\.\d{5}$"
+}
+
+function Normalize-AdobeVersion {
+    param(
+        [string]$VersionText
+    )
+
+    if ([string]::IsNullOrWhiteSpace($VersionText)) {
+        return $null
+    }
+
+    $match = [regex]::Match($VersionText, "\b(?<major>\d{2})\.(?<minor>\d{1,3})\.(?<build>\d{1,5})(?:\.\d+)?\b")
+
+    if (-not $match.Success) {
+        return $null
+    }
+
+    $major = [int]$match.Groups["major"].Value
+    $minor = [int]$match.Groups["minor"].Value
+    $build = [int]$match.Groups["build"].Value
+
+    return ("{0:00}.{1:000}.{2:00000}" -f $major, $minor, $build)
+}
+
+function Compare-VersionSafe {
+    param(
+        [string]$InstalledVersion,
+        [string]$LatestVersion
+    )
+
+    $installedNormalized = Normalize-AdobeVersion -VersionText $InstalledVersion
+    $latestNormalized = Normalize-AdobeVersion -VersionText $LatestVersion
+
+    if (-not $installedNormalized -or -not $latestNormalized) {
+        return $null
+    }
+
+    try {
+        return ([version]$installedNormalized).CompareTo([version]$latestNormalized)
+    }
+    catch {
+        return $null
+    }
 }
 
 function Invoke-AdobeWebRequest {
@@ -174,20 +217,6 @@ function Get-PropertyValue {
     return $property.Value
 }
 
-function Compare-VersionSafe {
-    param(
-        [string]$InstalledVersion,
-        [string]$LatestVersion
-    )
-
-    try {
-        return ([version]$InstalledVersion).CompareTo([version]$LatestVersion)
-    }
-    catch {
-        return $null
-    }
-}
-
 function Remove-DownloadedPatchFile {
     param(
         [Parameter(Mandatory = $true)]
@@ -218,7 +247,7 @@ function Update-AdobeUninstallDisplayVersion {
         [object]$Product,
 
         [Parameter(Mandatory = $true)]
-        [string]$TargetVersion
+        [string]$VersionToWrite
     )
 
     if (-not $UpdateInventoryDisplayVersion) {
@@ -231,23 +260,28 @@ function Update-AdobeUninstallDisplayVersion {
         return
     }
 
+    $normalizedVersionToWrite = Normalize-AdobeVersion -VersionText $VersionToWrite
+
+    if (-not $normalizedVersionToWrite) {
+        Write-Log "Cannot update uninstall DisplayVersion because '$VersionToWrite' is not a valid Adobe version."
+        return
+    }
+
     try {
-        $currentDisplayVersion = $null
+        $currentItem = Get-ItemProperty -Path $Product.RegistryPath -ErrorAction Stop
+        $currentDisplayVersion = Normalize-AdobeVersion -VersionText $currentItem.DisplayVersion
 
-        try {
-            $currentItem = Get-ItemProperty -Path $Product.RegistryPath -ErrorAction Stop
-            $currentDisplayVersion = $currentItem.DisplayVersion
-        }
-        catch {
-            Write-Log "Could not read current DisplayVersion for '$($Product.DisplayName)' before updating: $($_.Exception.Message)"
+        if ($currentDisplayVersion -eq $normalizedVersionToWrite) {
+            Write-Log "Uninstall registry DisplayVersion for '$($Product.DisplayName)' is already '$normalizedVersionToWrite'."
+            return
         }
 
-        Write-Log "Updating uninstall registry DisplayVersion for '$($Product.DisplayName)'. Current: '$currentDisplayVersion' Target: '$TargetVersion'."
+        Write-Log "Updating uninstall registry DisplayVersion for '$($Product.DisplayName)'. Current: '$($currentItem.DisplayVersion)' Target: '$normalizedVersionToWrite'."
 
         Set-ItemProperty `
             -Path $Product.RegistryPath `
             -Name "DisplayVersion" `
-            -Value $TargetVersion `
+            -Value $normalizedVersionToWrite `
             -ErrorAction Stop
 
         $updatedItem = Get-ItemProperty -Path $Product.RegistryPath -ErrorAction Stop
@@ -255,6 +289,68 @@ function Update-AdobeUninstallDisplayVersion {
     }
     catch {
         Write-Log "Could not update uninstall registry DisplayVersion for '$($Product.DisplayName)': $($_.Exception.Message)"
+    }
+}
+
+function Get-AdobeExecutableInfo {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Product
+    )
+
+    $candidatePaths = New-Object System.Collections.Generic.List[string]
+
+    if (-not [string]::IsNullOrWhiteSpace($Product.InstallLocation)) {
+        if ($Product.ProductType -eq "Reader") {
+            $candidatePaths.Add((Join-Path $Product.InstallLocation "AcroRd32.exe"))
+            $candidatePaths.Add((Join-Path $Product.InstallLocation "Reader\AcroRd32.exe"))
+        }
+        else {
+            $candidatePaths.Add((Join-Path $Product.InstallLocation "Acrobat.exe"))
+            $candidatePaths.Add((Join-Path $Product.InstallLocation "Acrobat\Acrobat.exe"))
+        }
+    }
+
+    if ($Product.ProductType -eq "Reader") {
+        $candidatePaths.Add("$env:ProgramFiles\Adobe\Acrobat Reader DC\Reader\AcroRd32.exe")
+        $candidatePaths.Add("${env:ProgramFiles(x86)}\Adobe\Acrobat Reader DC\Reader\AcroRd32.exe")
+    }
+    else {
+        $candidatePaths.Add("$env:ProgramFiles\Adobe\Acrobat DC\Acrobat\Acrobat.exe")
+        $candidatePaths.Add("${env:ProgramFiles(x86)}\Adobe\Acrobat DC\Acrobat\Acrobat.exe")
+    }
+
+    foreach ($path in ($candidatePaths | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)) {
+        if (Test-Path $path) {
+            try {
+                $item = Get-Item $path -ErrorAction Stop
+                $fileVersion = $item.VersionInfo.FileVersion
+                $productVersion = $item.VersionInfo.ProductVersion
+
+                $normalizedVersion = Normalize-AdobeVersion -VersionText $productVersion
+
+                if (-not $normalizedVersion) {
+                    $normalizedVersion = Normalize-AdobeVersion -VersionText $fileVersion
+                }
+
+                return [PSCustomObject]@{
+                    Path              = $path
+                    FileVersion       = $fileVersion
+                    ProductVersion    = $productVersion
+                    NormalizedVersion = $normalizedVersion
+                }
+            }
+            catch {
+                Write-Log "Could not read executable version from '$path': $($_.Exception.Message)"
+            }
+        }
+    }
+
+    return [PSCustomObject]@{
+        Path              = $null
+        FileVersion       = $null
+        ProductVersion    = $null
+        NormalizedVersion = $null
     }
 }
 
@@ -591,6 +687,43 @@ function Test-MsiSuccessCode {
     return $ExitCode -in @(0, 3010, 1641)
 }
 
+function Get-ProductUpdateState {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Product,
+
+        [Parameter(Mandatory = $true)]
+        [string]$TargetVersion
+    )
+
+    $exeInfo = Get-AdobeExecutableInfo -Product $Product
+    $displayVersionNormalized = Normalize-AdobeVersion -VersionText $Product.DisplayVersion
+
+    if ($exeInfo.NormalizedVersion) {
+        $comparison = Compare-VersionSafe -InstalledVersion $exeInfo.NormalizedVersion -LatestVersion $TargetVersion
+
+        return [PSCustomObject]@{
+            Source                = "Executable"
+            CurrentVersion        = $exeInfo.NormalizedVersion
+            DisplayVersion        = $displayVersionNormalized
+            ExecutablePath        = $exeInfo.Path
+            NeedsUpdate           = ($comparison -lt 0)
+            CanDetermineVersion   = ($null -ne $comparison)
+        }
+    }
+
+    $fallbackComparison = Compare-VersionSafe -InstalledVersion $Product.DisplayVersion -LatestVersion $TargetVersion
+
+    return [PSCustomObject]@{
+        Source                = "UninstallRegistry"
+        CurrentVersion        = $displayVersionNormalized
+        DisplayVersion        = $displayVersionNormalized
+        ExecutablePath        = $null
+        NeedsUpdate           = ($fallbackComparison -lt 0)
+        CanDetermineVersion   = ($null -ne $fallbackComparison)
+    }
+}
+
 # =========================
 # Main execution
 # =========================
@@ -614,8 +747,44 @@ try {
 
     Write-Log "Detected $($products.Count) Acrobat-adjacent product(s)."
 
+    $productStates = New-Object System.Collections.Generic.List[object]
+
     foreach ($product in $products) {
-        Write-Log "Detected product: $($product.DisplayName) | Version: $($product.DisplayVersion) | Type: $($product.ProductType) | Arch: $($product.Architecture) | Track: $($product.Track) | MUI detected: $($product.IsMUI) | RegistryPath: $($product.RegistryPath)"
+        $state = Get-ProductUpdateState -Product $product -TargetVersion $AdobeTargetVersion
+
+        Write-Log "Detected product: $($product.DisplayName) | Registry DisplayVersion: $($product.DisplayVersion) | ActualVersionSource: $($state.Source) | ActualVersion: $($state.CurrentVersion) | ExePath: $($state.ExecutablePath) | Type: $($product.ProductType) | Arch: $($product.Architecture) | Track: $($product.Track) | MUI detected: $($product.IsMUI) | RegistryPath: $($product.RegistryPath)"
+
+        # Fix ConnectWise-visible mismatch immediately if executable proves the app is already target/newer.
+        if ($product.Track -ne "UnsupportedOrClassic" -and $state.Source -eq "Executable" -and $state.CanDetermineVersion -and -not $state.NeedsUpdate) {
+            if ($state.DisplayVersion -ne $state.CurrentVersion) {
+                Write-Log "Inventory mismatch detected for '$($product.DisplayName)': registry DisplayVersion '$($product.DisplayVersion)' does not match executable version '$($state.CurrentVersion)'."
+                Update-AdobeUninstallDisplayVersion -Product $product -VersionToWrite $state.CurrentVersion
+            }
+            else {
+                Write-Log "No inventory mismatch detected for '$($product.DisplayName)'."
+            }
+        }
+
+        $productStates.Add([PSCustomObject]@{
+            Product = $product
+            State   = $state
+        })
+    }
+
+    $productsNeedingUpdate = @(
+        $productStates |
+            Where-Object {
+                $_.Product.Track -ne "UnsupportedOrClassic" -and
+                (
+                    ($_.State.CanDetermineVersion -and $_.State.NeedsUpdate) -or
+                    (-not $_.State.CanDetermineVersion)
+                )
+            }
+    )
+
+    if ($productsNeedingUpdate.Count -eq 0) {
+        Write-Log "No applicable Adobe Acrobat/Reader products require MSP installation. Any detected inventory mismatch has already been corrected."
+        exit 0
     }
 
     # =========================
@@ -636,7 +805,7 @@ try {
     $runningAdobeUserApps = @(Get-AdobeProcessesByName -ProcessNames $AdobeUserAppProcesses)
 
     if ($runningAdobeUserApps.Count -gt 0) {
-        Write-Log "Adobe Acrobat/Reader is actively open. Skipping update to avoid closing user documents."
+        Write-Log "Adobe Acrobat/Reader is actively open and at least one product requires an update. Skipping update to avoid closing user documents."
 
         foreach ($process in $runningAdobeUserApps) {
             Write-Log "Open Adobe app detected: $($process.Name) | PID: $($process.ProcessId) | Session: $($process.SessionId) | Owner: $($process.Owner)"
@@ -667,34 +836,22 @@ try {
     $overallExitCode = 0
     $updatedSomething = $false
 
-    foreach ($product in $products) {
-        Write-Log "Evaluating product: $($product.DisplayName)"
+    foreach ($entry in $productsNeedingUpdate) {
+        $product = $entry.Product
+        $state = $entry.State
+
+        Write-Log "Evaluating product for MSP install: $($product.DisplayName)"
 
         if ($product.Track -eq "UnsupportedOrClassic") {
             Write-Log "Skipping '$($product.DisplayName)' because it appears to be Classic/2020/2024/legacy or otherwise unsupported by this Continuous Track MSP script."
             continue
         }
 
-        if (-not [string]::IsNullOrWhiteSpace($product.DisplayVersion)) {
-            $comparison = Compare-VersionSafe -InstalledVersion $product.DisplayVersion -LatestVersion $AdobeTargetVersion
-
-            if ($null -eq $comparison) {
-                Write-Log "Could not compare installed version '$($product.DisplayVersion)' to target '$AdobeTargetVersion'. Continuing with update attempt."
-            }
-            elseif ($comparison -ge 0) {
-                Write-Log "'$($product.DisplayName)' is already current or newer. Installed: $($product.DisplayVersion), target: $AdobeTargetVersion."
-
-                # Even if already current, optionally ensure inventory metadata is correct.
-                Update-AdobeUninstallDisplayVersion -Product $product -TargetVersion $AdobeTargetVersion
-
-                continue
-            }
-            else {
-                Write-Log "'$($product.DisplayName)' requires update. Installed: $($product.DisplayVersion), target: $AdobeTargetVersion."
-            }
+        if ($state.CanDetermineVersion) {
+            Write-Log "'$($product.DisplayName)' requires update. Source: $($state.Source). Current: $($state.CurrentVersion), target: $AdobeTargetVersion."
         }
         else {
-            Write-Log "Installed version is missing for '$($product.DisplayName)'. Continuing with update attempt."
+            Write-Log "Could not determine reliable installed version for '$($product.DisplayName)'. Continuing with update attempt."
         }
 
         if ($product.ProductType -eq "Acrobat") {
@@ -752,7 +909,16 @@ try {
                 if (Test-MsiSuccessCode -ExitCode $exitCode) {
                     Write-Log "Patch succeeded for '$($product.DisplayName)' using '$patchFileName'."
 
-                    Update-AdobeUninstallDisplayVersion -Product $product -TargetVersion $AdobeTargetVersion
+                    $postInstallExeInfo = Get-AdobeExecutableInfo -Product $product
+
+                    if ($postInstallExeInfo.NormalizedVersion) {
+                        Write-Log "Post-install executable version for '$($product.DisplayName)' is '$($postInstallExeInfo.NormalizedVersion)' from '$($postInstallExeInfo.Path)'."
+                        Update-AdobeUninstallDisplayVersion -Product $product -VersionToWrite $postInstallExeInfo.NormalizedVersion
+                    }
+                    else {
+                        Write-Log "Could not verify post-install executable version for '$($product.DisplayName)'. Writing target version '$AdobeTargetVersion' to inventory DisplayVersion."
+                        Update-AdobeUninstallDisplayVersion -Product $product -VersionToWrite $AdobeTargetVersion
+                    }
 
                     Remove-DownloadedPatchFile -PatchPath $patchPath
 
