@@ -14,6 +14,7 @@
 #
 # Timeout behavior:
 #   - Adobe web requests have timeout/retry handling.
+#   - If Adobe release notes time out, script uses a fallback version and direct MSP URLs.
 #   - MSI installer execution has a maximum wait time.
 #
 # Cleanup behavior:
@@ -56,6 +57,12 @@ $InstallerTimeoutMinutes = 45
 
 # Adobe release notes source.
 $ReleaseNotesIndexUrl = "https://www.adobe.com/devnet-docs/acrobatetk/tools/ReleaseNotesDC/index.html"
+
+# Fallback values.
+# Update these when Adobe publishes a newer Continuous Track release.
+$FallbackAdobeVersion = "26.001.21563"
+$FallbackAdobeReleaseUrl = "https://www.adobe.com/devnet-docs/acrobatetk/tools/ReleaseNotesDC/continuous/dccontinuousapr2026qfe2.html"
+$DirectAdobeDownloadBaseUrl = "https://ardownload3.adobe.com/pub/adobe/acrobat/win/AcrobatDC"
 
 $AdobeWebHeaders = @{
     "User-Agent" = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
@@ -392,6 +399,7 @@ function Get-LatestAdobeContinuousRelease {
             Version      = $version
             SortVersion  = [version]$version
             Url          = Resolve-Url -BaseUrl $ReleaseNotesIndexUrl -Href $href
+            UsedFallback = $false
         }
     }
 
@@ -407,6 +415,32 @@ function Get-LatestAdobeContinuousRelease {
     Write-Log "Latest Adobe release page: $($latest.Url)"
 
     return $latest
+}
+
+function Get-FallbackAdobeContinuousRelease {
+    Write-Log "Using fallback Adobe Continuous Track version: $FallbackAdobeVersion"
+    Write-Log "Fallback release page reference: $FallbackAdobeReleaseUrl"
+
+    return [PSCustomObject]@{
+        Version      = $FallbackAdobeVersion
+        SortVersion  = [version]$FallbackAdobeVersion
+        Url          = $FallbackAdobeReleaseUrl
+        UsedFallback = $true
+    }
+}
+
+function Get-DirectAdobePatchUrl {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Version,
+
+        [Parameter(Mandatory = $true)]
+        [string]$PatchFileName
+    )
+
+    $versionNoDots = $Version.Replace(".", "")
+
+    return "$DirectAdobeDownloadBaseUrl/$versionNoDots/$PatchFileName"
 }
 
 function Get-AcrobatPatchFileName {
@@ -473,41 +507,60 @@ function Get-ReaderPatchFileNames {
 function Get-AdobePatchUrl {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$ReleaseUrl,
+        [object]$Release,
 
         [Parameter(Mandatory = $true)]
         [string]$PatchFileName
     )
 
-    Write-Log "Looking for patch file on Adobe release page: $PatchFileName"
+    $directUrl = Get-DirectAdobePatchUrl -Version $Release.Version -PatchFileName $PatchFileName
 
-    $response = Invoke-AdobeWebRequest -Uri $ReleaseUrl
-    $escapedFileName = [regex]::Escape($PatchFileName)
+    if ($Release.UsedFallback) {
+        Write-Log "Release notes lookup used fallback. Using direct Adobe download URL: $directUrl"
+        return $directUrl
+    }
 
     try {
-        $link = $response.Links |
-            Where-Object { $_.href -match $escapedFileName } |
-            Select-Object -First 1
+        Write-Log "Looking for patch file on Adobe release page: $PatchFileName"
 
-        if ($link -and $link.href) {
-            return Resolve-Url -BaseUrl $ReleaseUrl -Href $link.href
+        $response = Invoke-AdobeWebRequest -Uri $Release.Url
+        $escapedFileName = [regex]::Escape($PatchFileName)
+
+        try {
+            $link = $response.Links |
+                Where-Object { $_.href -match $escapedFileName } |
+                Select-Object -First 1
+
+            if ($link -and $link.href) {
+                $resolvedUrl = Resolve-Url -BaseUrl $Release.Url -Href $link.href
+                Write-Log "Resolved patch URL from release page: $resolvedUrl"
+                return $resolvedUrl
+            }
         }
+        catch {
+            # Fall through to raw HTML parsing.
+        }
+
+        $hrefMatch = [regex]::Match(
+            $response.Content,
+            'href="(?<href>[^"]*' + $escapedFileName + '[^"]*)"',
+            [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+        )
+
+        if ($hrefMatch.Success) {
+            $resolvedUrl = Resolve-Url -BaseUrl $Release.Url -Href $hrefMatch.Groups["href"].Value
+            Write-Log "Resolved patch URL from release page HTML: $resolvedUrl"
+            return $resolvedUrl
+        }
+
+        Write-Log "Could not find patch file '$PatchFileName' on release page. Falling back to direct URL: $directUrl"
+        return $directUrl
     }
     catch {
-        # Fall through to raw HTML parsing.
+        Write-Log "Could not query Adobe release page for '$PatchFileName': $($_.Exception.Message)"
+        Write-Log "Falling back to direct Adobe download URL: $directUrl"
+        return $directUrl
     }
-
-    $hrefMatch = [regex]::Match(
-        $response.Content,
-        'href="(?<href>[^"]*' + $escapedFileName + '[^"]*)"',
-        [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
-    )
-
-    if ($hrefMatch.Success) {
-        return Resolve-Url -BaseUrl $ReleaseUrl -Href $hrefMatch.Groups["href"].Value
-    }
-
-    throw "Could not find patch file '$PatchFileName' on Adobe release page."
 }
 
 function Install-AdobePatch {
@@ -624,11 +677,23 @@ try {
     }
 
     # =========================
-    # Update process
+    # Determine update version
     # =========================
 
-    $latestRelease = Get-LatestAdobeContinuousRelease
+    try {
+        $latestRelease = Get-LatestAdobeContinuousRelease
+    }
+    catch {
+        Write-Log "Could not retrieve Adobe Continuous Track release notes: $($_.Exception.Message)"
+        Write-Log "Continuing with fallback version instead of failing the script."
+        $latestRelease = Get-FallbackAdobeContinuousRelease
+    }
+
     $latestVersion = $latestRelease.Version
+
+    # =========================
+    # Update process
+    # =========================
 
     $overallExitCode = 0
     $updatedSomething = $false
@@ -679,15 +744,7 @@ try {
         foreach ($patchFileName in $candidatePatchFiles) {
             Write-Log "Trying patch candidate for '$($product.DisplayName)': $patchFileName"
 
-            try {
-                $patchUrl = Get-AdobePatchUrl -ReleaseUrl $latestRelease.Url -PatchFileName $patchFileName
-            }
-            catch {
-                Write-Log "Could not resolve patch URL for '$patchFileName': $($_.Exception.Message)"
-                $lastExitCode = 1
-                continue
-            }
-
+            $patchUrl = Get-AdobePatchUrl -Release $latestRelease -PatchFileName $patchFileName
             $patchPath = Join-Path $WorkingDirectory $patchFileName
 
             try {
