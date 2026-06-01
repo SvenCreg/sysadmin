@@ -16,6 +16,10 @@
 #   - No Adobe release-note scraping.
 #   - Set the desired Adobe version manually in $AdobeTargetVersion.
 #
+# Inventory behavior:
+#   - After successful MSP installation, updates the product uninstall registry DisplayVersion.
+#   - This helps ConnectWise RMM software inventory report the updated version.
+#
 # Cleanup behavior:
 #   - Downloaded MSP patch files are removed after successful installation.
 #   - Reader MSPs that return "patch not applicable" during MUI/non-MUI fallback are also removed.
@@ -58,6 +62,10 @@ $DownloadOnly = $false
 
 # Remove downloaded MSP files after successful use.
 $CleanupDownloadedPatches = $true
+
+# Update Windows uninstall registry DisplayVersion after successful MSP install.
+# This helps ConnectWise RMM software inventory report the patched version.
+$UpdateInventoryDisplayVersion = $true
 
 # Web timeout/retry settings.
 $WebRequestTimeoutSeconds = 120
@@ -201,6 +209,52 @@ function Remove-DownloadedPatchFile {
     }
     catch {
         Write-Log "Could not remove downloaded patch file '$PatchPath': $($_.Exception.Message)"
+    }
+}
+
+function Update-AdobeUninstallDisplayVersion {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Product,
+
+        [Parameter(Mandatory = $true)]
+        [string]$TargetVersion
+    )
+
+    if (-not $UpdateInventoryDisplayVersion) {
+        Write-Log "Inventory DisplayVersion update is disabled."
+        return
+    }
+
+    if ([string]::IsNullOrWhiteSpace($Product.RegistryPath)) {
+        Write-Log "Cannot update uninstall DisplayVersion because RegistryPath is missing for '$($Product.DisplayName)'."
+        return
+    }
+
+    try {
+        $currentDisplayVersion = $null
+
+        try {
+            $currentItem = Get-ItemProperty -Path $Product.RegistryPath -ErrorAction Stop
+            $currentDisplayVersion = $currentItem.DisplayVersion
+        }
+        catch {
+            Write-Log "Could not read current DisplayVersion for '$($Product.DisplayName)' before updating: $($_.Exception.Message)"
+        }
+
+        Write-Log "Updating uninstall registry DisplayVersion for '$($Product.DisplayName)'. Current: '$currentDisplayVersion' Target: '$TargetVersion'."
+
+        Set-ItemProperty `
+            -Path $Product.RegistryPath `
+            -Name "DisplayVersion" `
+            -Value $TargetVersion `
+            -ErrorAction Stop
+
+        $updatedItem = Get-ItemProperty -Path $Product.RegistryPath -ErrorAction Stop
+        Write-Log "Updated uninstall registry DisplayVersion for '$($Product.DisplayName)' to '$($updatedItem.DisplayVersion)'."
+    }
+    catch {
+        Write-Log "Could not update uninstall registry DisplayVersion for '$($Product.DisplayName)': $($_.Exception.Message)"
     }
 }
 
@@ -561,7 +615,7 @@ try {
     Write-Log "Detected $($products.Count) Acrobat-adjacent product(s)."
 
     foreach ($product in $products) {
-        Write-Log "Detected product: $($product.DisplayName) | Version: $($product.DisplayVersion) | Type: $($product.ProductType) | Arch: $($product.Architecture) | Track: $($product.Track) | MUI detected: $($product.IsMUI)"
+        Write-Log "Detected product: $($product.DisplayName) | Version: $($product.DisplayVersion) | Type: $($product.ProductType) | Arch: $($product.Architecture) | Track: $($product.Track) | MUI detected: $($product.IsMUI) | RegistryPath: $($product.RegistryPath)"
     }
 
     # =========================
@@ -629,6 +683,10 @@ try {
             }
             elseif ($comparison -ge 0) {
                 Write-Log "'$($product.DisplayName)' is already current or newer. Installed: $($product.DisplayVersion), target: $AdobeTargetVersion."
+
+                # Even if already current, optionally ensure inventory metadata is correct.
+                Update-AdobeUninstallDisplayVersion -Product $product -TargetVersion $AdobeTargetVersion
+
                 continue
             }
             else {
@@ -693,6 +751,9 @@ try {
 
                 if (Test-MsiSuccessCode -ExitCode $exitCode) {
                     Write-Log "Patch succeeded for '$($product.DisplayName)' using '$patchFileName'."
+
+                    Update-AdobeUninstallDisplayVersion -Product $product -TargetVersion $AdobeTargetVersion
+
                     Remove-DownloadedPatchFile -PatchPath $patchPath
 
                     $updatedSomething = $true
