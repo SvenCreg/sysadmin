@@ -12,24 +12,17 @@
 #   - It does NOT reopen Adobe helper processes afterward.
 #   - It does NOT require launch flags.
 #
+# Timeout behavior:
+#   - Adobe web requests have timeout/retry handling.
+#   - MSI installer execution has a maximum wait time.
+#
 # Cleanup behavior:
 #   - Downloaded MSP patch files are removed after successful installation.
 #   - Reader MSPs that return "patch not applicable" during MUI/non-MUI fallback are also removed.
 #   - Logs are kept for troubleshooting.
-#
-# Scope:
-#   - Adobe Acrobat Continuous Track
-#   - Adobe Acrobat Reader Continuous Track
-#   - x86 and x64
-#   - Reader MUI and non-MUI
-#
-# Does NOT patch:
-#   - Photoshop, Illustrator, Creative Cloud, etc.
-#   - Adobe Genuine Service
-#   - Adobe Acrobat Update Service only
-#   - Classic/2020/2024/legacy Acrobat tracks
 
 $ErrorActionPreference = "Stop"
+$ProgressPreference = "SilentlyContinue"
 
 # =========================
 # ConnectWise RMM settings
@@ -51,14 +44,23 @@ $ReaderPatchPreference = "AutoTryBoth"
 $DownloadOnly = $false
 
 # Remove downloaded MSP files after successful use.
-# Logs are still retained.
 $CleanupDownloadedPatches = $true
 
-# =========================
-# Adobe release notes source
-# =========================
+# Web timeout/retry settings.
+$WebRequestTimeoutSeconds = 120
+$WebRequestRetries = 3
+$WebRequestRetryDelaySeconds = 10
 
+# Installer timeout.
+$InstallerTimeoutMinutes = 45
+
+# Adobe release notes source.
 $ReleaseNotesIndexUrl = "https://www.adobe.com/devnet-docs/acrobatetk/tools/ReleaseNotesDC/index.html"
+
+$AdobeWebHeaders = @{
+    "User-Agent" = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
+    "Accept"     = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+}
 
 try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -80,6 +82,51 @@ function Write-Log {
     $line = "$(Get-Date -Format s) $Message"
     Write-Host $line
     Add-Content -Path $LogFile -Value $line
+}
+
+function Invoke-AdobeWebRequest {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Uri,
+
+        [string]$OutFile
+    )
+
+    for ($attempt = 1; $attempt -le $WebRequestRetries; $attempt++) {
+        try {
+            Write-Log ("Web request attempt {0} of {1}: {2}" -f $attempt, $WebRequestRetries, $Uri)
+
+            if ([string]::IsNullOrWhiteSpace($OutFile)) {
+                return Invoke-WebRequest `
+                    -UseBasicParsing `
+                    -Uri $Uri `
+                    -Headers $AdobeWebHeaders `
+                    -TimeoutSec $WebRequestTimeoutSeconds `
+                    -ErrorAction Stop
+            }
+            else {
+                Invoke-WebRequest `
+                    -UseBasicParsing `
+                    -Uri $Uri `
+                    -Headers $AdobeWebHeaders `
+                    -TimeoutSec $WebRequestTimeoutSeconds `
+                    -OutFile $OutFile `
+                    -ErrorAction Stop
+
+                return $true
+            }
+        }
+        catch {
+            Write-Log ("Web request failed on attempt {0} of {1}: {2}" -f $attempt, $WebRequestRetries, $_.Exception.Message)
+
+            if ($attempt -lt $WebRequestRetries) {
+                Write-Log "Waiting $WebRequestRetryDelaySeconds second(s) before retrying web request."
+                Start-Sleep -Seconds $WebRequestRetryDelaySeconds
+            }
+        }
+    }
+
+    throw "Web request failed after $WebRequestRetries attempt(s): $Uri"
 }
 
 function Get-PropertyValue {
@@ -237,7 +284,6 @@ function Get-InstalledAdobeAcrobatAdjacentProducts {
                 continue
             }
 
-            # Include Adobe Acrobat / Reader only.
             $isAcrobatFamily =
                 $displayName -match "^Adobe\s+Acrobat(\s+Reader)?\b" -or
                 $displayName -match "^Adobe\s+Reader\b"
@@ -246,7 +292,6 @@ function Get-InstalledAdobeAcrobatAdjacentProducts {
                 continue
             }
 
-            # Exclude adjacent services/components that are not the app itself.
             if ($displayName -match "(Update\s+Service|Refresh\s+Manager|Synchronizer|Genuine|ARM|Notification|Collaboration|Core\s+Sync)") {
                 continue
             }
@@ -287,7 +332,6 @@ function Get-InstalledAdobeAcrobatAdjacentProducts {
 
             $track = "ContinuousAssumed"
 
-            # Avoid forcing Continuous Track MSPs onto Classic/legacy installs.
             if (
                 $displayName -match "(Classic|2020|2024|2017|2015| XI\b| X\b)" -or
                 $installLocation -match "(Acrobat\s+2020|Acrobat\s+2024|Acrobat\s+2017|Acrobat\s+2015|Acrobat\s+XI|Acrobat\s+X)"
@@ -326,7 +370,7 @@ function Get-InstalledAdobeAcrobatAdjacentProducts {
 function Get-LatestAdobeContinuousRelease {
     Write-Log "Checking Adobe Continuous Track release notes."
 
-    $response = Invoke-WebRequest -UseBasicParsing -Uri $ReleaseNotesIndexUrl
+    $response = Invoke-AdobeWebRequest -Uri $ReleaseNotesIndexUrl
     $content = $response.Content
 
     $matches = [regex]::Matches(
@@ -345,9 +389,9 @@ function Get-LatestAdobeContinuousRelease {
         $href = $match.Groups["href"].Value
 
         [PSCustomObject]@{
-            Version     = $version
-            SortVersion = [version]$version
-            Url         = Resolve-Url -BaseUrl $ReleaseNotesIndexUrl -Href $href
+            Version      = $version
+            SortVersion  = [version]$version
+            Url          = Resolve-Url -BaseUrl $ReleaseNotesIndexUrl -Href $href
         }
     }
 
@@ -437,8 +481,7 @@ function Get-AdobePatchUrl {
 
     Write-Log "Looking for patch file on Adobe release page: $PatchFileName"
 
-    $response = Invoke-WebRequest -UseBasicParsing -Uri $ReleaseUrl
-
+    $response = Invoke-AdobeWebRequest -Uri $ReleaseUrl
     $escapedFileName = [regex]::Escape($PatchFileName)
 
     try {
@@ -475,15 +518,34 @@ function Install-AdobePatch {
 
     $msiLog = Join-Path $WorkingDirectory ("msiexec-" + [IO.Path]::GetFileNameWithoutExtension($PatchPath) + ".log")
 
-    # /p applies the MSP patch.
-    # /qn runs silently.
-    # /norestart prevents surprise reboot.
-    # /L*v creates a verbose MSI log.
     $arguments = "/p `"$PatchPath`" /qn /norestart /L*v `"$msiLog`""
 
     Write-Log "Running: msiexec.exe $arguments"
+    Write-Log "Installer timeout is set to $InstallerTimeoutMinutes minute(s)."
 
-    $process = Start-Process -FilePath "msiexec.exe" -ArgumentList $arguments -Wait -PassThru
+    $process = Start-Process -FilePath "msiexec.exe" -ArgumentList $arguments -PassThru
+
+    $timeoutMilliseconds = [int]([TimeSpan]::FromMinutes($InstallerTimeoutMinutes).TotalMilliseconds)
+    $completed = $process.WaitForExit($timeoutMilliseconds)
+
+    if (-not $completed) {
+        Write-Log "msiexec did not finish within $InstallerTimeoutMinutes minute(s). Attempting to stop installer process."
+
+        try {
+            Stop-Process -Id $process.Id -Force -ErrorAction Stop
+            Write-Log "Stopped timed-out msiexec process. PID: $($process.Id)"
+        }
+        catch {
+            Write-Log "Could not stop timed-out msiexec process. PID: $($process.Id). Error: $($_.Exception.Message)"
+        }
+
+        Write-Log "MSI log may contain more detail: $msiLog"
+
+        # 1460 = timeout
+        return 1460
+    }
+
+    $process.Refresh()
 
     Write-Log "msiexec exit code: $($process.ExitCode)"
     Write-Log "MSI log: $msiLog"
@@ -501,207 +563,228 @@ function Test-MsiSuccessCode {
 # Main execution
 # =========================
 
-Write-Log "Starting Adobe Acrobat/Reader update process."
+try {
+    Write-Log "Starting Adobe Acrobat/Reader update process."
 
-$products = @(Get-InstalledAdobeAcrobatAdjacentProducts)
+    $products = @(Get-InstalledAdobeAcrobatAdjacentProducts)
 
-if ($products.Count -eq 0) {
-    Write-Log "No Adobe Acrobat or Adobe Acrobat Reader products detected. Nothing to update."
-    exit 0
-}
-
-Write-Log "Detected $($products.Count) Acrobat-adjacent product(s)."
-
-foreach ($product in $products) {
-    Write-Log "Detected product: $($product.DisplayName) | Version: $($product.DisplayVersion) | Type: $($product.ProductType) | Arch: $($product.Architecture) | Track: $($product.Track) | MUI detected: $($product.IsMUI)"
-}
-
-# =========================
-# Adobe in-use safety check
-# =========================
-# If Acrobat.exe or AcroRd32.exe is open, skip.
-# If only helper/background Adobe processes are running, close them before patching.
-
-$AdobeUserAppProcesses = @(
-    "Acrobat.exe",
-    "AcroRd32.exe"
-)
-
-$AdobeBackgroundProcesses = @(
-    "AcroCEF.exe",
-    "RdrCEF.exe",
-    "AdobeCollabSync.exe"
-)
-
-$runningAdobeUserApps = @(Get-AdobeProcessesByName -ProcessNames $AdobeUserAppProcesses)
-
-if ($runningAdobeUserApps.Count -gt 0) {
-    Write-Log "Adobe Acrobat/Reader is actively open. Skipping update to avoid closing user documents."
-
-    foreach ($process in $runningAdobeUserApps) {
-        Write-Log "Open Adobe app detected: $($process.Name) | PID: $($process.ProcessId) | Session: $($process.SessionId) | Owner: $($process.Owner)"
+    if ($products.Count -eq 0) {
+        Write-Log "No Adobe Acrobat or Adobe Acrobat Reader products detected. Nothing to update."
+        exit 0
     }
 
-    Write-Log "Exiting without installing. ConnectWise can retry on the next scheduled run."
-    exit 0
-}
+    Write-Log "Detected $($products.Count) Acrobat-adjacent product(s)."
 
-$runningAdobeBackgroundProcesses = @(Get-AdobeProcessesByName -ProcessNames $AdobeBackgroundProcesses)
-
-if ($runningAdobeBackgroundProcesses.Count -gt 0) {
-    Write-Log "No Acrobat/Reader user app is open, but Adobe background helper processes are running."
-    Write-Log "Closing Adobe background helper processes before applying MSP update."
-
-    Stop-AdobeBackgroundProcesses -Processes $runningAdobeBackgroundProcesses
-
-    Start-Sleep -Seconds 3
-}
-else {
-    Write-Log "No active Acrobat/Reader user app or Adobe background helper processes detected."
-}
-
-# =========================
-# Update process
-# =========================
-
-$latestRelease = Get-LatestAdobeContinuousRelease
-$latestVersion = $latestRelease.Version
-
-$overallExitCode = 0
-$updatedSomething = $false
-
-foreach ($product in $products) {
-    Write-Log "Evaluating product: $($product.DisplayName)"
-
-    if ($product.Track -eq "UnsupportedOrClassic") {
-        Write-Log "Skipping '$($product.DisplayName)' because it appears to be Classic/2020/2024/legacy or otherwise unsupported by this Continuous Track MSP script."
-        continue
+    foreach ($product in $products) {
+        Write-Log "Detected product: $($product.DisplayName) | Version: $($product.DisplayVersion) | Type: $($product.ProductType) | Arch: $($product.Architecture) | Track: $($product.Track) | MUI detected: $($product.IsMUI)"
     }
 
-    if (-not [string]::IsNullOrWhiteSpace($product.DisplayVersion)) {
-        $comparison = Compare-VersionSafe -InstalledVersion $product.DisplayVersion -LatestVersion $latestVersion
+    # =========================
+    # Adobe in-use safety check
+    # =========================
+    # If Acrobat.exe or AcroRd32.exe is open, skip.
+    # If only helper/background Adobe processes are running, close them before patching.
 
-        if ($null -eq $comparison) {
-            Write-Log "Could not compare installed version '$($product.DisplayVersion)' to latest '$latestVersion'. Continuing with update attempt."
+    $AdobeUserAppProcesses = @(
+        "Acrobat.exe",
+        "AcroRd32.exe"
+    )
+
+    $AdobeBackgroundProcesses = @(
+        "AcroCEF.exe",
+        "RdrCEF.exe",
+        "AdobeCollabSync.exe"
+    )
+
+    $runningAdobeUserApps = @(Get-AdobeProcessesByName -ProcessNames $AdobeUserAppProcesses)
+
+    if ($runningAdobeUserApps.Count -gt 0) {
+        Write-Log "Adobe Acrobat/Reader is actively open. Skipping update to avoid closing user documents."
+
+        foreach ($process in $runningAdobeUserApps) {
+            Write-Log "Open Adobe app detected: $($process.Name) | PID: $($process.ProcessId) | Session: $($process.SessionId) | Owner: $($process.Owner)"
         }
-        elseif ($comparison -ge 0) {
-            Write-Log "'$($product.DisplayName)' is already current or newer. Installed: $($product.DisplayVersion), latest: $latestVersion."
+
+        Write-Log "Exiting without installing. ConnectWise can retry on the next scheduled run."
+        exit 0
+    }
+
+    $runningAdobeBackgroundProcesses = @(Get-AdobeProcessesByName -ProcessNames $AdobeBackgroundProcesses)
+
+    if ($runningAdobeBackgroundProcesses.Count -gt 0) {
+        Write-Log "No Acrobat/Reader user app is open, but Adobe background helper processes are running."
+        Write-Log "Closing Adobe background helper processes before applying MSP update."
+
+        Stop-AdobeBackgroundProcesses -Processes $runningAdobeBackgroundProcesses
+
+        Start-Sleep -Seconds 3
+    }
+    else {
+        Write-Log "No active Acrobat/Reader user app or Adobe background helper processes detected."
+    }
+
+    # =========================
+    # Update process
+    # =========================
+
+    $latestRelease = Get-LatestAdobeContinuousRelease
+    $latestVersion = $latestRelease.Version
+
+    $overallExitCode = 0
+    $updatedSomething = $false
+
+    foreach ($product in $products) {
+        Write-Log "Evaluating product: $($product.DisplayName)"
+
+        if ($product.Track -eq "UnsupportedOrClassic") {
+            Write-Log "Skipping '$($product.DisplayName)' because it appears to be Classic/2020/2024/legacy or otherwise unsupported by this Continuous Track MSP script."
             continue
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($product.DisplayVersion)) {
+            $comparison = Compare-VersionSafe -InstalledVersion $product.DisplayVersion -LatestVersion $latestVersion
+
+            if ($null -eq $comparison) {
+                Write-Log "Could not compare installed version '$($product.DisplayVersion)' to latest '$latestVersion'. Continuing with update attempt."
+            }
+            elseif ($comparison -ge 0) {
+                Write-Log "'$($product.DisplayName)' is already current or newer. Installed: $($product.DisplayVersion), latest: $latestVersion."
+                continue
+            }
+            else {
+                Write-Log "'$($product.DisplayName)' requires update. Installed: $($product.DisplayVersion), latest: $latestVersion."
+            }
         }
         else {
-            Write-Log "'$($product.DisplayName)' requires update. Installed: $($product.DisplayVersion), latest: $latestVersion."
-        }
-    }
-    else {
-        Write-Log "Installed version is missing for '$($product.DisplayName)'. Continuing with update attempt."
-    }
-
-    if ($product.ProductType -eq "Acrobat") {
-        $candidatePatchFiles = @(
-            Get-AcrobatPatchFileName -Architecture $product.Architecture -Version $latestVersion
-        )
-    }
-    else {
-        $candidatePatchFiles = @(
-            Get-ReaderPatchFileNames `
-                -Architecture $product.Architecture `
-                -Version $latestVersion `
-                -DetectedMUI ([bool]$product.IsMUI)
-        )
-    }
-
-    $productUpdated = $false
-    $lastExitCode = 0
-
-    foreach ($patchFileName in $candidatePatchFiles) {
-        Write-Log "Trying patch candidate for '$($product.DisplayName)': $patchFileName"
-
-        try {
-            $patchUrl = Get-AdobePatchUrl -ReleaseUrl $latestRelease.Url -PatchFileName $patchFileName
-        }
-        catch {
-            Write-Log "Could not resolve patch URL for '$patchFileName': $($_.Exception.Message)"
-            $lastExitCode = 1
-            continue
+            Write-Log "Installed version is missing for '$($product.DisplayName)'. Continuing with update attempt."
         }
 
-        $patchPath = Join-Path $WorkingDirectory $patchFileName
-
-        try {
-            Write-Log "Downloading patch: $patchUrl"
-            Invoke-WebRequest -UseBasicParsing -Uri $patchUrl -OutFile $patchPath
+        if ($product.ProductType -eq "Acrobat") {
+            $candidatePatchFiles = @(
+                Get-AcrobatPatchFileName -Architecture $product.Architecture -Version $latestVersion
+            )
         }
-        catch {
-            Write-Log "Failed to download patch '$patchFileName': $($_.Exception.Message)"
-            $lastExitCode = 1
-            continue
-        }
-
-        if (-not (Test-Path $patchPath)) {
-            Write-Log "Patch download did not create expected file: $patchPath"
-            $lastExitCode = 1
-            continue
+        else {
+            $candidatePatchFiles = @(
+                Get-ReaderPatchFileNames `
+                    -Architecture $product.Architecture `
+                    -Version $latestVersion `
+                    -DetectedMUI ([bool]$product.IsMUI)
+            )
         }
 
-        Write-Log "Patch downloaded successfully: $patchPath"
+        $productUpdated = $false
+        $lastExitCode = 0
 
-        if ($DownloadOnly) {
-            Write-Log "DownloadOnly is enabled. Skipping installation and leaving patch file in place: $patchPath"
-            $productUpdated = $true
-            break
-        }
+        foreach ($patchFileName in $candidatePatchFiles) {
+            Write-Log "Trying patch candidate for '$($product.DisplayName)': $patchFileName"
 
-        try {
-            $exitCode = Install-AdobePatch -PatchPath $patchPath
-            $lastExitCode = $exitCode
+            try {
+                $patchUrl = Get-AdobePatchUrl -ReleaseUrl $latestRelease.Url -PatchFileName $patchFileName
+            }
+            catch {
+                Write-Log "Could not resolve patch URL for '$patchFileName': $($_.Exception.Message)"
+                $lastExitCode = 1
+                continue
+            }
 
-            if (Test-MsiSuccessCode -ExitCode $exitCode) {
-                Write-Log "Patch succeeded for '$($product.DisplayName)' using '$patchFileName'."
-                Remove-DownloadedPatchFile -PatchPath $patchPath
+            $patchPath = Join-Path $WorkingDirectory $patchFileName
 
-                $updatedSomething = $true
+            try {
+                Write-Log "Downloading patch: $patchUrl"
+                Invoke-AdobeWebRequest -Uri $patchUrl -OutFile $patchPath
+            }
+            catch {
+                Write-Log "Failed to download patch '$patchFileName': $($_.Exception.Message)"
+                $lastExitCode = 1
+                continue
+            }
+
+            if (-not (Test-Path $patchPath)) {
+                Write-Log "Patch download did not create expected file: $patchPath"
+                $lastExitCode = 1
+                continue
+            }
+
+            Write-Log "Patch downloaded successfully: $patchPath"
+
+            if ($DownloadOnly) {
+                Write-Log "DownloadOnly is enabled. Skipping installation and leaving patch file in place: $patchPath"
                 $productUpdated = $true
                 break
             }
 
-            if ($product.ProductType -eq "Reader" -and $exitCode -eq 1642) {
-                Write-Log "MSI exit code 1642 means this patch is not applicable. For Reader, trying the alternate MUI/non-MUI patch if available."
-                Remove-DownloadedPatchFile -PatchPath $patchPath
-                continue
-            }
+            try {
+                $exitCode = Install-AdobePatch -PatchPath $patchPath
+                $lastExitCode = $exitCode
 
-            Write-Log "Patch failed for '$($product.DisplayName)' using '$patchFileName' with exit code $exitCode."
-            Write-Log "Leaving downloaded patch file for troubleshooting: $patchPath"
+                if (Test-MsiSuccessCode -ExitCode $exitCode) {
+                    Write-Log "Patch succeeded for '$($product.DisplayName)' using '$patchFileName'."
+                    Remove-DownloadedPatchFile -PatchPath $patchPath
+
+                    $updatedSomething = $true
+                    $productUpdated = $true
+                    break
+                }
+
+                if ($exitCode -eq 1460) {
+                    Write-Log "Installer timed out. Leaving downloaded patch file for troubleshooting: $patchPath"
+                    $overallExitCode = 1460
+                    break
+                }
+
+                if ($exitCode -eq 1618) {
+                    Write-Log "Another Windows Installer operation is already in progress. Exiting cleanly so ConnectWise can retry later."
+                    Remove-DownloadedPatchFile -PatchPath $patchPath
+                    exit 0
+                }
+
+                if ($product.ProductType -eq "Reader" -and $exitCode -eq 1642) {
+                    Write-Log "MSI exit code 1642 means this patch is not applicable. For Reader, trying the alternate MUI/non-MUI patch if available."
+                    Remove-DownloadedPatchFile -PatchPath $patchPath
+                    continue
+                }
+
+                Write-Log "Patch failed for '$($product.DisplayName)' using '$patchFileName' with exit code $exitCode."
+                Write-Log "Leaving downloaded patch file for troubleshooting: $patchPath"
+            }
+            catch {
+                Write-Log "Exception while installing '$patchFileName': $($_.Exception.Message)"
+                Write-Log "Leaving downloaded patch file for troubleshooting: $patchPath"
+                $lastExitCode = 1
+            }
         }
-        catch {
-            Write-Log "Exception while installing '$patchFileName': $($_.Exception.Message)"
-            Write-Log "Leaving downloaded patch file for troubleshooting: $patchPath"
-            $lastExitCode = 1
+
+        if (-not $productUpdated) {
+            Write-Log "No patch candidate completed successfully for '$($product.DisplayName)'."
+
+            if ($lastExitCode -ne 0) {
+                $overallExitCode = $lastExitCode
+            }
+            elseif ($overallExitCode -ne 0) {
+                # Preserve earlier non-zero exit code.
+            }
+            else {
+                $overallExitCode = 1
+            }
         }
     }
 
-    if (-not $productUpdated) {
-        Write-Log "No patch candidate completed successfully for '$($product.DisplayName)'."
-
-        if ($lastExitCode -ne 0) {
-            $overallExitCode = $lastExitCode
+    if ($overallExitCode -eq 0) {
+        if ($updatedSomething) {
+            Write-Log "Adobe Acrobat/Reader update process completed successfully."
         }
         else {
-            $overallExitCode = 1
+            Write-Log "No applicable Adobe Acrobat/Reader products required installation."
         }
+
+        exit 0
     }
+
+    Write-Log "Adobe Acrobat/Reader update process completed with errors. Exit code: $overallExitCode"
+    exit $overallExitCode
 }
-
-if ($overallExitCode -eq 0) {
-    if ($updatedSomething) {
-        Write-Log "Adobe Acrobat/Reader update process completed successfully."
-    }
-    else {
-        Write-Log "No applicable Adobe Acrobat/Reader products required installation."
-    }
-
-    exit 0
+catch {
+    Write-Log "Fatal script error: $($_.Exception.Message)"
+    exit 1
 }
-
-Write-Log "Adobe Acrobat/Reader update process completed with errors. Exit code: $overallExitCode"
-exit $overallExitCode
