@@ -8,6 +8,8 @@
 # Important behavior:
 #   - Uses the actual Acrobat.exe / AcroRd32.exe version as the source of truth when available.
 #   - Fixes uninstall registry DisplayVersion for ConnectWise inventory if Adobe is already updated.
+#   - Fixes Adobe Windows Installer inventory metadata if stale patch records show old versions.
+#   - Fixes Adobe ARM per-user tProcessedVersion metadata in loaded HKEY_USERS hives.
 #   - Only runs the MSP if the actual executable version is older than the target.
 #
 # Safety behavior:
@@ -64,8 +66,19 @@ $DownloadOnly = $false
 $CleanupDownloadedPatches = $true
 
 # Update Windows uninstall registry DisplayVersion after successful verification/install.
-# This helps ConnectWise RMM software inventory report the patched version.
 $UpdateInventoryDisplayVersion = $true
+
+# Update Adobe Windows Installer metadata that some inventory tools may read.
+# This is limited to Adobe Acrobat / Adobe Acrobat Reader keys only.
+# It does not delete patch records.
+$UpdateInstallerInventoryMetadata = $true
+
+# Update Adobe ARM per-user metadata in loaded HKEY_USERS hives.
+# This is limited to Adobe ARM Products\Reader or Products\Acrobat tProcessedVersion.
+$UpdateAdobeArmUserMetadata = $true
+
+# Creates a CSV backup before changing inventory-related metadata.
+$BackupInstallerInventoryMetadata = $true
 
 # Web timeout/retry settings.
 $WebRequestTimeoutSeconds = 120
@@ -90,6 +103,7 @@ catch {
 New-Item -ItemType Directory -Path $WorkingDirectory -Force | Out-Null
 
 $LogFile = Join-Path $WorkingDirectory "AdobeAcrobatAdjacentUpdate.log"
+$InstallerMetadataBackupFile = Join-Path $WorkingDirectory "InstallerInventoryMetadataBackup.csv"
 
 function Write-Log {
     param(
@@ -217,6 +231,40 @@ function Get-PropertyValue {
     return $property.Value
 }
 
+function Backup-InventoryMetadataChange {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RegistryPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ValueName,
+
+        [string]$OldValue,
+
+        [string]$NewValue,
+
+        [string]$Reason
+    )
+
+    if (-not $BackupInstallerInventoryMetadata) {
+        return
+    }
+
+    try {
+        [PSCustomObject]@{
+            Timestamp    = Get-Date -Format s
+            RegistryPath = $RegistryPath
+            ValueName    = $ValueName
+            OldValue     = $OldValue
+            NewValue     = $NewValue
+            Reason       = $Reason
+        } | Export-Csv -Path $InstallerMetadataBackupFile -NoTypeInformation -Append -Force
+    }
+    catch {
+        Write-Log "Could not write inventory metadata backup record: $($_.Exception.Message)"
+    }
+}
+
 function Remove-DownloadedPatchFile {
     param(
         [Parameter(Mandatory = $true)]
@@ -238,6 +286,12 @@ function Remove-DownloadedPatchFile {
     }
     catch {
         Write-Log "Could not remove downloaded patch file '$PatchPath': $($_.Exception.Message)"
+    }
+}
+
+function Ensure-HkuRegistryDrive {
+    if (-not (Get-PSDrive -Name HKU -ErrorAction SilentlyContinue)) {
+        New-PSDrive -Name HKU -PSProvider Registry -Root HKEY_USERS | Out-Null
     }
 }
 
@@ -278,6 +332,13 @@ function Update-AdobeUninstallDisplayVersion {
 
         Write-Log "Updating uninstall registry DisplayVersion for '$($Product.DisplayName)'. Current: '$($currentItem.DisplayVersion)' Target: '$normalizedVersionToWrite'."
 
+        Backup-InventoryMetadataChange `
+            -RegistryPath $Product.RegistryPath `
+            -ValueName "DisplayVersion" `
+            -OldValue $currentItem.DisplayVersion `
+            -NewValue $normalizedVersionToWrite `
+            -Reason "Correct Adobe uninstall registry DisplayVersion after executable verification"
+
         Set-ItemProperty `
             -Path $Product.RegistryPath `
             -Name "DisplayVersion" `
@@ -290,6 +351,300 @@ function Update-AdobeUninstallDisplayVersion {
     catch {
         Write-Log "Could not update uninstall registry DisplayVersion for '$($Product.DisplayName)': $($_.Exception.Message)"
     }
+}
+
+function Test-InstallerMetadataMatchesProduct {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DisplayName,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ProductType
+    )
+
+    if ([string]::IsNullOrWhiteSpace($DisplayName)) {
+        return $false
+    }
+
+    if ($ProductType -eq "Reader") {
+        return ($DisplayName -match "^Adobe\s+Acrobat\s+Reader\b" -or $DisplayName -match "^Adobe\s+Reader\b")
+    }
+
+    return ($DisplayName -match "^Adobe\s+Acrobat\b" -and $DisplayName -notmatch "\bReader\b")
+}
+
+function Update-AdobeInstallerProductInstallProperties {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Product,
+
+        [Parameter(Mandatory = $true)]
+        [string]$VersionToWrite
+    )
+
+    if (-not $UpdateInstallerInventoryMetadata) {
+        Write-Log "Installer inventory metadata update is disabled."
+        return
+    }
+
+    $normalizedVersionToWrite = Normalize-AdobeVersion -VersionText $VersionToWrite
+
+    if (-not $normalizedVersionToWrite) {
+        Write-Log "Cannot update Installer InstallProperties because '$VersionToWrite' is not a valid Adobe version."
+        return
+    }
+
+    $installPropertyKeys = Get-ItemProperty `
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\*\Products\*\InstallProperties" `
+        -ErrorAction SilentlyContinue |
+        Where-Object {
+            Test-InstallerMetadataMatchesProduct -DisplayName $_.DisplayName -ProductType $Product.ProductType
+        }
+
+    foreach ($item in $installPropertyKeys) {
+        $currentDisplayVersion = Normalize-AdobeVersion -VersionText $item.DisplayVersion
+
+        if (-not $currentDisplayVersion) {
+            continue
+        }
+
+        $comparison = Compare-VersionSafe -InstalledVersion $currentDisplayVersion -LatestVersion $normalizedVersionToWrite
+
+        if ($null -eq $comparison) {
+            continue
+        }
+
+        if ($comparison -ge 0) {
+            Write-Log "Installer InstallProperties DisplayVersion is already current/newer for '$($item.DisplayName)': '$($item.DisplayVersion)'."
+            continue
+        }
+
+        try {
+            Write-Log "Updating Installer InstallProperties DisplayVersion for '$($item.DisplayName)'. Current: '$($item.DisplayVersion)' Target: '$normalizedVersionToWrite'."
+
+            Backup-InventoryMetadataChange `
+                -RegistryPath $item.PSPath `
+                -ValueName "DisplayVersion" `
+                -OldValue $item.DisplayVersion `
+                -NewValue $normalizedVersionToWrite `
+                -Reason "Correct ConnectWise-visible Adobe inventory metadata after executable verification"
+
+            Set-ItemProperty `
+                -Path $item.PSPath `
+                -Name "DisplayVersion" `
+                -Value $normalizedVersionToWrite `
+                -ErrorAction Stop
+
+            Write-Log "Updated Installer InstallProperties DisplayVersion at: $($item.PSPath)"
+        }
+        catch {
+            Write-Log "Could not update Installer InstallProperties DisplayVersion at '$($item.PSPath)': $($_.Exception.Message)"
+        }
+    }
+}
+
+function Update-AdobeInstallerPatchDisplayNames {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Product,
+
+        [Parameter(Mandatory = $true)]
+        [string]$VersionToWrite
+    )
+
+    if (-not $UpdateInstallerInventoryMetadata) {
+        Write-Log "Installer patch metadata update is disabled."
+        return
+    }
+
+    $normalizedVersionToWrite = Normalize-AdobeVersion -VersionText $VersionToWrite
+
+    if (-not $normalizedVersionToWrite) {
+        Write-Log "Cannot update Installer patch DisplayName entries because '$VersionToWrite' is not a valid Adobe version."
+        return
+    }
+
+    $patchKeys = Get-ItemProperty `
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\*\Products\*\Patches\*" `
+        -ErrorAction SilentlyContinue |
+        Where-Object {
+            Test-InstallerMetadataMatchesProduct -DisplayName $_.DisplayName -ProductType $Product.ProductType
+        }
+
+    foreach ($patch in $patchKeys) {
+        $currentDisplayName = $patch.DisplayName
+
+        if ([string]::IsNullOrWhiteSpace($currentDisplayName)) {
+            continue
+        }
+
+        $currentVersion = Normalize-AdobeVersion -VersionText $currentDisplayName
+
+        if (-not $currentVersion) {
+            continue
+        }
+
+        $comparison = Compare-VersionSafe -InstalledVersion $currentVersion -LatestVersion $normalizedVersionToWrite
+
+        if ($null -eq $comparison) {
+            continue
+        }
+
+        if ($comparison -ge 0) {
+            Write-Log "Installer patch DisplayName is already current/newer: '$currentDisplayName'."
+            continue
+        }
+
+        $newDisplayName = [regex]::Replace(
+            $currentDisplayName,
+            "\(\d{2}\.\d{1,3}\.\d{1,5}\)",
+            "($normalizedVersionToWrite)"
+        )
+
+        if ($newDisplayName -eq $currentDisplayName) {
+            continue
+        }
+
+        try {
+            Write-Log "Updating Installer patch DisplayName. Current: '$currentDisplayName' New: '$newDisplayName'."
+
+            Backup-InventoryMetadataChange `
+                -RegistryPath $patch.PSPath `
+                -ValueName "DisplayName" `
+                -OldValue $currentDisplayName `
+                -NewValue $newDisplayName `
+                -Reason "Correct stale Adobe MSP patch display metadata after executable verification"
+
+            Set-ItemProperty `
+                -Path $patch.PSPath `
+                -Name "DisplayName" `
+                -Value $newDisplayName `
+                -ErrorAction Stop
+
+            Write-Log "Updated Installer patch DisplayName at: $($patch.PSPath)"
+        }
+        catch {
+            Write-Log "Could not update Installer patch DisplayName at '$($patch.PSPath)': $($_.Exception.Message)"
+        }
+    }
+}
+
+function Update-AdobeArmProcessedVersion {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Product,
+
+        [Parameter(Mandatory = $true)]
+        [string]$VersionToWrite
+    )
+
+    if (-not $UpdateAdobeArmUserMetadata) {
+        Write-Log "Adobe ARM user metadata update is disabled."
+        return
+    }
+
+    $normalizedVersionToWrite = Normalize-AdobeVersion -VersionText $VersionToWrite
+
+    if (-not $normalizedVersionToWrite) {
+        Write-Log "Cannot update Adobe ARM tProcessedVersion because '$VersionToWrite' is not a valid Adobe version."
+        return
+    }
+
+    try {
+        Ensure-HkuRegistryDrive
+    }
+    catch {
+        Write-Log "Could not access HKEY_USERS registry drive: $($_.Exception.Message)"
+        return
+    }
+
+    if ($Product.ProductType -eq "Reader") {
+        $productFolderNames = @("Reader")
+    }
+    else {
+        $productFolderNames = @("Acrobat")
+    }
+
+    $userHives = Get-ChildItem "HKU:\" -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.PSChildName -like "S-*" -and
+            $_.PSChildName -notmatch "_Classes$"
+        }
+
+    foreach ($productFolderName in $productFolderNames) {
+        foreach ($hive in $userHives) {
+            $path = "HKU:\$($hive.PSChildName)\Software\Adobe\Adobe ARM\1.0\ARM\Products\$productFolderName"
+
+            if (-not (Test-Path $path)) {
+                continue
+            }
+
+            try {
+                $item = Get-ItemProperty -Path $path -ErrorAction Stop
+                $currentVersion = Normalize-AdobeVersion -VersionText $item.tProcessedVersion
+
+                if ($currentVersion -eq $normalizedVersionToWrite) {
+                    Write-Log "Adobe ARM tProcessedVersion is already current at '$path': '$($item.tProcessedVersion)'."
+                    continue
+                }
+
+                Write-Log "Updating Adobe ARM tProcessedVersion at '$path'. Current: '$($item.tProcessedVersion)' Target: '$normalizedVersionToWrite'."
+
+                Backup-InventoryMetadataChange `
+                    -RegistryPath $path `
+                    -ValueName "tProcessedVersion" `
+                    -OldValue $item.tProcessedVersion `
+                    -NewValue $normalizedVersionToWrite `
+                    -Reason "Correct stale Adobe ARM per-user updater metadata after executable verification"
+
+                Set-ItemProperty `
+                    -Path $path `
+                    -Name "tProcessedVersion" `
+                    -Value $normalizedVersionToWrite `
+                    -ErrorAction Stop
+
+                Write-Log "Updated Adobe ARM tProcessedVersion at '$path' to '$normalizedVersionToWrite'."
+            }
+            catch {
+                Write-Log "Could not update Adobe ARM tProcessedVersion at '$path': $($_.Exception.Message)"
+            }
+        }
+    }
+}
+
+function Repair-AdobeInventoryMetadata {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Product,
+
+        [Parameter(Mandatory = $true)]
+        [string]$VerifiedVersion
+    )
+
+    $normalizedVerifiedVersion = Normalize-AdobeVersion -VersionText $VerifiedVersion
+
+    if (-not $normalizedVerifiedVersion) {
+        Write-Log "Cannot repair Adobe inventory metadata because '$VerifiedVersion' is not a valid verified version."
+        return
+    }
+
+    Write-Log "Repairing Adobe inventory metadata for '$($Product.DisplayName)' using verified version '$normalizedVerifiedVersion'."
+
+    Update-AdobeUninstallDisplayVersion `
+        -Product $Product `
+        -VersionToWrite $normalizedVerifiedVersion
+
+    Update-AdobeInstallerProductInstallProperties `
+        -Product $Product `
+        -VersionToWrite $normalizedVerifiedVersion
+
+    Update-AdobeInstallerPatchDisplayNames `
+        -Product $Product `
+        -VersionToWrite $normalizedVerifiedVersion
+
+    Update-AdobeArmProcessedVersion `
+        -Product $Product `
+        -VersionToWrite $normalizedVerifiedVersion
 }
 
 function Get-AdobeExecutableInfo {
@@ -707,7 +1062,7 @@ function Get-ProductUpdateState {
             CurrentVersion        = $exeInfo.NormalizedVersion
             DisplayVersion        = $displayVersionNormalized
             ExecutablePath        = $exeInfo.Path
-            NeedsUpdate           = ($comparison -lt 0)
+            NeedsUpdate           = ($null -ne $comparison -and $comparison -lt 0)
             CanDetermineVersion   = ($null -ne $comparison)
         }
     }
@@ -719,7 +1074,7 @@ function Get-ProductUpdateState {
         CurrentVersion        = $displayVersionNormalized
         DisplayVersion        = $displayVersionNormalized
         ExecutablePath        = $null
-        NeedsUpdate           = ($fallbackComparison -lt 0)
+        NeedsUpdate           = ($null -ne $fallbackComparison -and $fallbackComparison -lt 0)
         CanDetermineVersion   = ($null -ne $fallbackComparison)
     }
 }
@@ -754,15 +1109,9 @@ try {
 
         Write-Log "Detected product: $($product.DisplayName) | Registry DisplayVersion: $($product.DisplayVersion) | ActualVersionSource: $($state.Source) | ActualVersion: $($state.CurrentVersion) | ExePath: $($state.ExecutablePath) | Type: $($product.ProductType) | Arch: $($product.Architecture) | Track: $($product.Track) | MUI detected: $($product.IsMUI) | RegistryPath: $($product.RegistryPath)"
 
-        # Fix ConnectWise-visible mismatch immediately if executable proves the app is already target/newer.
         if ($product.Track -ne "UnsupportedOrClassic" -and $state.Source -eq "Executable" -and $state.CanDetermineVersion -and -not $state.NeedsUpdate) {
-            if ($state.DisplayVersion -ne $state.CurrentVersion) {
-                Write-Log "Inventory mismatch detected for '$($product.DisplayName)': registry DisplayVersion '$($product.DisplayVersion)' does not match executable version '$($state.CurrentVersion)'."
-                Update-AdobeUninstallDisplayVersion -Product $product -VersionToWrite $state.CurrentVersion
-            }
-            else {
-                Write-Log "No inventory mismatch detected for '$($product.DisplayName)'."
-            }
+            Write-Log "Executable confirms '$($product.DisplayName)' is already current/newer. Repairing any stale inventory metadata."
+            Repair-AdobeInventoryMetadata -Product $product -VerifiedVersion $state.CurrentVersion
         }
 
         $productStates.Add([PSCustomObject]@{
@@ -842,11 +1191,6 @@ try {
 
         Write-Log "Evaluating product for MSP install: $($product.DisplayName)"
 
-        if ($product.Track -eq "UnsupportedOrClassic") {
-            Write-Log "Skipping '$($product.DisplayName)' because it appears to be Classic/2020/2024/legacy or otherwise unsupported by this Continuous Track MSP script."
-            continue
-        }
-
         if ($state.CanDetermineVersion) {
             Write-Log "'$($product.DisplayName)' requires update. Source: $($state.Source). Current: $($state.CurrentVersion), target: $AdobeTargetVersion."
         }
@@ -913,11 +1257,11 @@ try {
 
                     if ($postInstallExeInfo.NormalizedVersion) {
                         Write-Log "Post-install executable version for '$($product.DisplayName)' is '$($postInstallExeInfo.NormalizedVersion)' from '$($postInstallExeInfo.Path)'."
-                        Update-AdobeUninstallDisplayVersion -Product $product -VersionToWrite $postInstallExeInfo.NormalizedVersion
+                        Repair-AdobeInventoryMetadata -Product $product -VerifiedVersion $postInstallExeInfo.NormalizedVersion
                     }
                     else {
-                        Write-Log "Could not verify post-install executable version for '$($product.DisplayName)'. Writing target version '$AdobeTargetVersion' to inventory DisplayVersion."
-                        Update-AdobeUninstallDisplayVersion -Product $product -VersionToWrite $AdobeTargetVersion
+                        Write-Log "Could not verify post-install executable version for '$($product.DisplayName)'. Writing target version '$AdobeTargetVersion' to inventory metadata."
+                        Repair-AdobeInventoryMetadata -Product $product -VerifiedVersion $AdobeTargetVersion
                     }
 
                     Remove-DownloadedPatchFile -PatchPath $patchPath
