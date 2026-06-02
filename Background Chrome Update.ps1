@@ -1,24 +1,26 @@
 $ErrorActionPreference = "SilentlyContinue"
 
-$chromeWasRunning = @(Get-Process chrome).Count -gt 0
-
+# Check whether Chrome is actually installed before doing anything else
 $chrome = @(
   "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
   "$env:ProgramFiles(x86)\Google\Chrome\Application\chrome.exe",
   "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe"
 ) | Where-Object { Test-Path $_ } | Select-Object -First 1
 
+# If Chrome is not installed, do nothing and exit successfully
 if (-not $chrome) {
-  Write-Error "chrome.exe not found."
-  exit 1
+  exit 0
 }
 
-# Try old GoogleUpdate.exe first, then newer GoogleUpdater\*\updater.exe
+$chromeWasRunning = @(Get-Process chrome).Count -gt 0
+
+# Try old GoogleUpdate.exe first
 $oldUpdater = @(
   "$env:ProgramFiles(x86)\Google\Update\GoogleUpdate.exe",
   "$env:LOCALAPPDATA\Google\Update\GoogleUpdate.exe"
 ) | Where-Object { Test-Path $_ } | Select-Object -First 1
 
+# Try newer GoogleUpdater location
 $newUpdater = Get-ChildItem `
   -Path "$env:ProgramFiles(x86)\Google\GoogleUpdater", "$env:LOCALAPPDATA\Google\GoogleUpdater" `
   -Filter "updater.exe" `
@@ -26,6 +28,7 @@ $newUpdater = Get-ChildItem `
   Sort-Object LastWriteTime -Descending |
   Select-Object -First 1
 
+# If Chrome exists but no updater is found, do nothing
 if ($oldUpdater) {
   Start-Process $oldUpdater -ArgumentList "/ua /installsource scheduler" -Wait
 }
@@ -33,8 +36,7 @@ elseif ($newUpdater) {
   Start-Process $newUpdater.FullName -ArgumentList "--wake" -Wait
 }
 else {
-  Write-Error "No Google updater executable found."
-  exit 1
+  exit 0
 }
 
 # Only open/close Chrome if it was not already running
@@ -61,3 +63,5 @@ if (-not $chromeWasRunning) {
     Where-Object { $_.StartTime -ge $startedAt.AddSeconds(-2) } |
     Stop-Process -Force
 }
+
+exit 0
