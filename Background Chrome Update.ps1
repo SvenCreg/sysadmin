@@ -10,6 +10,33 @@ function Write-Result {
   Write-Host "[$timestamp] [$Level] $Message"
 }
 
+function Get-ChromeVersion {
+  param (
+    [string]$ChromePath
+  )
+
+  if (-not $ChromePath) {
+    return $null
+  }
+
+  if (-not (Test-Path $ChromePath)) {
+    return $null
+  }
+
+  try {
+    $version = (Get-Item $ChromePath).VersionInfo.ProductVersion
+
+    if (-not $version) {
+      $version = (Get-Item $ChromePath).VersionInfo.FileVersion
+    }
+
+    return $version
+  }
+  catch {
+    return $null
+  }
+}
+
 Write-Result "Starting Chrome update check."
 
 $programFilesX86 = ${env:ProgramFiles(x86)}
@@ -29,6 +56,15 @@ if (-not $chrome) {
 }
 
 Write-Result "Chrome found at: $chrome"
+
+$startingVersion = Get-ChromeVersion -ChromePath $chrome
+
+if ($startingVersion) {
+  Write-Result "Chrome version before update: $startingVersion"
+}
+else {
+  Write-Result "Could not detect Chrome version before update." "WARN"
+}
 
 $chromeWasRunning = @(Get-Process chrome).Count -gt 0
 
@@ -65,8 +101,11 @@ if ($newUpdaterSearchPaths) {
     Select-Object -First 1
 }
 
-# If Chrome exists but no updater is found, do nothing
+$updaterExitCode = $null
+$updaterUsed = $null
+
 if ($oldUpdater) {
+  $updaterUsed = $oldUpdater
   Write-Result "Using legacy updater: $oldUpdater"
 
   $process = Start-Process `
@@ -75,9 +114,11 @@ if ($oldUpdater) {
     -Wait `
     -PassThru
 
-  Write-Result "Legacy updater finished with exit code: $($process.ExitCode)"
+  $updaterExitCode = $process.ExitCode
+  Write-Result "Legacy updater finished with exit code: $updaterExitCode"
 }
 elseif ($newUpdater) {
+  $updaterUsed = $newUpdater.FullName
   Write-Result "Using newer updater: $($newUpdater.FullName)"
 
   $process = Start-Process `
@@ -86,10 +127,18 @@ elseif ($newUpdater) {
     -Wait `
     -PassThru
 
-  Write-Result "Newer updater finished with exit code: $($process.ExitCode)"
+  $updaterExitCode = $process.ExitCode
+  Write-Result "Newer updater finished with exit code: $updaterExitCode"
 }
 else {
   Write-Result "Chrome is installed, but no Google updater executable was found. No update action taken." "SKIP"
+
+  $endingVersion = Get-ChromeVersion -ChromePath $chrome
+
+  if ($endingVersion) {
+    Write-Result "Chrome version after script: $endingVersion"
+  }
+
   exit 0
 }
 
@@ -158,6 +207,28 @@ if (-not $chromeWasRunning) {
 }
 else {
   Write-Result "Chrome was already running before this script started, so no Chrome windows were opened or closed."
+}
+
+# Re-check Chrome version after updater/browser processing
+$endingVersion = Get-ChromeVersion -ChromePath $chrome
+
+if ($endingVersion) {
+  Write-Result "Chrome version after update check: $endingVersion"
+}
+else {
+  Write-Result "Could not detect Chrome version after update check." "WARN"
+}
+
+if ($startingVersion -and $endingVersion) {
+  if ($startingVersion -ne $endingVersion) {
+    Write-Result "Chrome update completed. Version changed from $startingVersion to $endingVersion." "SUCCESS"
+  }
+  else {
+    Write-Result "Chrome version did not change. It may already be current, no update was available, or an update may require a future browser restart." "INFO"
+  }
+}
+else {
+  Write-Result "Version comparison could not be completed because one or both version checks failed." "WARN"
 }
 
 Write-Result "Chrome update script completed."
