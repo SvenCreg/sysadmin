@@ -10,33 +10,6 @@ function Write-Result {
   Write-Host "[$timestamp] [$Level] $Message"
 }
 
-function Get-ChromeVersion {
-  param (
-    [string]$ChromePath
-  )
-
-  if (-not $ChromePath) {
-    return $null
-  }
-
-  if (-not (Test-Path $ChromePath)) {
-    return $null
-  }
-
-  try {
-    $version = (Get-Item $ChromePath).VersionInfo.ProductVersion
-
-    if (-not $version) {
-      $version = (Get-Item $ChromePath).VersionInfo.FileVersion
-    }
-
-    return $version
-  }
-  catch {
-    return $null
-  }
-}
-
 function Test-IsAdmin {
   try {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -46,6 +19,55 @@ function Test-IsAdmin {
   catch {
     return $false
   }
+}
+
+function Get-ChromeVersion {
+  param (
+    [string]$ChromePath
+  )
+
+  if (-not $ChromePath -or -not (Test-Path $ChromePath)) {
+    return $null
+  }
+
+  try {
+    $item = Get-Item $ChromePath
+
+    if ($item.VersionInfo.ProductVersion) {
+      return $item.VersionInfo.ProductVersion
+    }
+
+    return $item.VersionInfo.FileVersion
+  }
+  catch {
+    return $null
+  }
+}
+
+function Get-LatestUpdater {
+  param (
+    [string]$Scope
+  )
+
+  $programFilesX86 = ${env:ProgramFiles(x86)}
+
+  if ($Scope -eq "Machine") {
+    $root = "$programFilesX86\Google\GoogleUpdater"
+  }
+  else {
+    $root = "$env:LOCALAPPDATA\Google\GoogleUpdater"
+  }
+
+  if (-not (Test-Path $root)) {
+    return $null
+  }
+
+  return Get-ChildItem `
+    -Path $root `
+    -Filter "updater.exe" `
+    -Recurse |
+    Sort-Object LastWriteTime -Descending |
+    Select-Object -First 1
 }
 
 Write-Result "Starting Chrome update check."
@@ -85,7 +107,7 @@ Write-Result "Chrome found at: $chrome"
 Write-Result "Detected Chrome install scope: $chromeScope"
 
 if ($chromeScope -eq "Machine" -and -not $isAdmin) {
-  Write-Result "Machine-wide Chrome detected, but PowerShell is not running as Administrator. Updater may fail. Run as admin for best results." "WARN"
+  Write-Result "Machine-wide Chrome detected, but PowerShell is not running as Administrator. The updater may fail unless run elevated." "WARN"
 }
 
 $startingVersion = Get-ChromeVersion -ChromePath $chrome
@@ -106,73 +128,24 @@ else {
   Write-Result "Chrome is not currently running."
 }
 
-# Legacy updater locations
-$oldUpdaterCandidates = @(
-  [PSCustomObject]@{
-    Path  = "$programFilesX86\Google\Update\GoogleUpdate.exe"
-    Scope = "Machine"
-  },
-  [PSCustomObject]@{
-    Path  = "$env:LOCALAPPDATA\Google\Update\GoogleUpdate.exe"
-    Scope = "User"
-  }
-)
+# Prefer legacy updater if present for the same scope.
+$legacyUpdater = $null
 
-$oldUpdaterInfo = $oldUpdaterCandidates |
-  Where-Object { Test-Path $_.Path } |
-  Select-Object -First 1
-
-# New updater locations
-$newUpdaterCandidates = @()
-
-$systemUpdaterRoot = "$programFilesX86\Google\GoogleUpdater"
-$userUpdaterRoot = "$env:LOCALAPPDATA\Google\GoogleUpdater"
-
-if (Test-Path $systemUpdaterRoot) {
-  $newUpdaterCandidates += Get-ChildItem `
-    -Path $systemUpdaterRoot `
-    -Filter "updater.exe" `
-    -Recurse |
-    ForEach-Object {
-      [PSCustomObject]@{
-        Path          = $_.FullName
-        Scope         = "Machine"
-        LastWriteTime = $_.LastWriteTime
-      }
-    }
+if ($chromeScope -eq "Machine") {
+  $legacyUpdater = "$programFilesX86\Google\Update\GoogleUpdate.exe"
 }
-
-if (Test-Path $userUpdaterRoot) {
-  $newUpdaterCandidates += Get-ChildItem `
-    -Path $userUpdaterRoot `
-    -Filter "updater.exe" `
-    -Recurse |
-    ForEach-Object {
-      [PSCustomObject]@{
-        Path          = $_.FullName
-        Scope         = "User"
-        LastWriteTime = $_.LastWriteTime
-      }
-    }
+else {
+  $legacyUpdater = "$env:LOCALAPPDATA\Google\Update\GoogleUpdate.exe"
 }
-
-$newUpdaterInfo = $newUpdaterCandidates |
-  Sort-Object LastWriteTime -Descending |
-  Select-Object -First 1
 
 $updaterExitCode = $null
-$updaterUsed = $null
-$updaterScope = $null
 
-if ($oldUpdaterInfo) {
-  $updaterUsed = $oldUpdaterInfo.Path
-  $updaterScope = $oldUpdaterInfo.Scope
-
-  Write-Result "Using legacy updater: $updaterUsed"
-  Write-Result "Updater scope: $updaterScope"
+if ($legacyUpdater -and (Test-Path $legacyUpdater)) {
+  Write-Result "Using legacy GoogleUpdate.exe: $legacyUpdater"
+  Write-Result "Updater arguments: /ua /installsource scheduler"
 
   $process = Start-Process `
-    -FilePath $updaterUsed `
+    -FilePath $legacyUpdater `
     -ArgumentList "/ua /installsource scheduler" `
     -Wait `
     -PassThru
@@ -180,24 +153,27 @@ if ($oldUpdaterInfo) {
   $updaterExitCode = $process.ExitCode
   Write-Result "Legacy updater finished with exit code: $updaterExitCode"
 }
-elseif ($newUpdaterInfo) {
-  $updaterUsed = $newUpdaterInfo.Path
-  $updaterScope = $newUpdaterInfo.Scope
+else {
+  $newUpdater = Get-LatestUpdater -Scope $chromeScope
 
-  Write-Result "Using newer updater: $updaterUsed"
-  Write-Result "Updater scope: $updaterScope"
+  if (-not $newUpdater) {
+    Write-Result "Chrome is installed, but no matching Google updater executable was found. No update action taken." "SKIP"
+    exit 0
+  }
 
-  if ($updaterScope -eq "Machine") {
-    $updaterArgs = "--wake --system"
+  Write-Result "Using newer Google updater: $($newUpdater.FullName)"
+
+  if ($chromeScope -eq "Machine") {
+    $updaterArgs = @("--update-apps", "--system")
   }
   else {
-    $updaterArgs = "--wake"
+    $updaterArgs = @("--update-apps")
   }
 
-  Write-Result "Updater arguments: $updaterArgs"
+  Write-Result "Updater arguments: $($updaterArgs -join ' ')"
 
   $process = Start-Process `
-    -FilePath $updaterUsed `
+    -FilePath $newUpdater.FullName `
     -ArgumentList $updaterArgs `
     -Wait `
     -PassThru
@@ -206,30 +182,20 @@ elseif ($newUpdaterInfo) {
   Write-Result "Newer updater finished with exit code: $updaterExitCode"
 
   if ($updaterExitCode -eq 75009) {
-    Write-Result "Updater returned 75009. For machine-wide installs, this often means the updater call/scope/permissions need attention. Confirm this script is running as Administrator." "WARN"
+    Write-Result "Updater still returned 75009. This is coming from the existing Google updater itself, not winget or the script fallback." "WARN"
+    Write-Result "For machine-wide Chrome, confirm the script is running elevated or as SYSTEM." "WARN"
   }
 }
-else {
-  Write-Result "Chrome is installed, but no Google updater executable was found. No update action taken." "SKIP"
 
-  $endingVersion = Get-ChromeVersion -ChromePath $chrome
-
-  if ($endingVersion) {
-    Write-Result "Chrome version after script: $endingVersion"
-  }
-
-  exit 0
-}
-
-# Only open/close Chrome if it was not already running
+# Only open/close Chrome if it was not already running.
 if (-not $chromeWasRunning) {
-  Write-Result "Opening Chrome to chrome://settings/help so it can process the update state."
+  Write-Result "Opening Chrome to chrome://settings/help so Chrome can process update state."
 
   $startedAt = Get-Date
 
   Start-Process $chrome -ArgumentList "chrome://settings/help"
 
-  Write-Result "Waiting 30 seconds for Chrome to process the update state."
+  Write-Result "Waiting 30 seconds."
   Start-Sleep -Seconds 30
 
   $startedChromeProcesses = Get-Process chrome |
@@ -271,9 +237,7 @@ if (-not $chromeWasRunning) {
 
     if ($remainingChromeProcesses) {
       Write-Result "Force-closing remaining Chrome processes started by this script." "WARN"
-
       $remainingChromeProcesses | Stop-Process -Force
-
       Write-Result "Remaining Chrome processes closed."
     }
     else {
@@ -302,14 +266,10 @@ if ($startingVersion -and $endingVersion) {
     Write-Result "Chrome update completed. Version changed from $startingVersion to $endingVersion." "SUCCESS"
   }
   else {
-    Write-Result "Chrome version did not change. It may already be current, no update was available, or the update may require a later Chrome restart." "INFO"
+    Write-Result "Chrome version did not change. It may already be current, no update was available, or the update requires a later browser restart." "INFO"
   }
 }
-else {
-  Write-Result "Version comparison could not be completed because one or both version checks failed." "WARN"
-}
 
-# Show likely updater log locations
 Write-Result "Possible updater logs:"
 Write-Result "$programFilesX86\Google\GoogleUpdater\updater.log"
 Write-Result "$env:LOCALAPPDATA\Google\GoogleUpdater\updater.log"
