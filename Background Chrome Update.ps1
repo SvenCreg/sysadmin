@@ -44,56 +44,173 @@ function Get-ChromeVersion {
   }
 }
 
-function Get-LatestUpdater {
-  param (
-    [string]$Scope
-  )
-
+function Get-ChromeInstall {
   $programFilesX86 = ${env:ProgramFiles(x86)}
 
-  if ($Scope -eq "Machine") {
-    $root = "$programFilesX86\Google\GoogleUpdater"
+  $candidates = @(
+    [PSCustomObject]@{
+      Path  = "$env:ProgramFiles\Google\Chrome\Application\chrome.exe"
+      Scope = "Machine"
+    },
+    [PSCustomObject]@{
+      Path  = "$programFilesX86\Google\Chrome\Application\chrome.exe"
+      Scope = "Machine"
+    },
+    [PSCustomObject]@{
+      Path  = "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe"
+      Scope = "User"
+    }
+  )
+
+  return $candidates |
+    Where-Object { Test-Path $_.Path } |
+    Select-Object -First 1
+}
+
+function Get-GoogleUpdateTasks {
+  param (
+    [string]$ChromeScope
+  )
+
+  $allTasks = Get-ScheduledTask |
+    Where-Object {
+      $_.TaskName -like "GoogleUpdateTask*" -or
+      $_.TaskName -like "GoogleUpdaterTask*" -or
+      $_.TaskPath -like "\GoogleSystem\*" -or
+      $_.TaskPath -like "\GoogleUser\*" -or
+      $_.TaskPath -like "\GoogleUpdate\*"
+    }
+
+  if (-not $allTasks) {
+    return @()
+  }
+
+  if ($ChromeScope -eq "Machine") {
+    $preferred = $allTasks |
+      Where-Object {
+        $_.TaskName -like "*Machine*" -or
+        $_.TaskName -like "*System*" -or
+        $_.TaskPath -like "\GoogleSystem\*"
+      }
   }
   else {
-    $root = "$env:LOCALAPPDATA\Google\GoogleUpdater"
+    $preferred = $allTasks |
+      Where-Object {
+        $_.TaskName -like "*User*" -or
+        $_.TaskPath -like "\GoogleUser\*"
+      }
   }
 
-  if (-not (Test-Path $root)) {
-    return $null
+  if ($preferred) {
+    return @($preferred)
   }
 
-  return Get-ChildItem `
-    -Path $root `
-    -Filter "updater.exe" `
-    -Recurse |
-    Sort-Object LastWriteTime -Descending |
-    Select-Object -First 1
+  return @($allTasks)
+}
+
+function Wait-ForTaskToFinish {
+  param (
+    [string]$TaskName,
+    [string]$TaskPath,
+    [int]$TimeoutSeconds = 180
+  )
+
+  $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+
+  do {
+    Start-Sleep -Seconds 5
+
+    $task = Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath
+
+    if ($task.State -ne "Running") {
+      break
+    }
+  }
+  while ((Get-Date) -lt $deadline)
+
+  $info = Get-ScheduledTaskInfo -TaskName $TaskName -TaskPath $TaskPath
+
+  return $info.LastTaskResult
+}
+
+function Invoke-GoogleUpdateScheduledTasks {
+  param (
+    [string]$ChromeScope
+  )
+
+  $tasks = Get-GoogleUpdateTasks -ChromeScope $ChromeScope
+
+  if (-not $tasks -or $tasks.Count -eq 0) {
+    Write-Result "No Google Update / Google Updater scheduled tasks were found." "WARN"
+    return $false
+  }
+
+  Write-Result "Found $($tasks.Count) Google updater scheduled task(s)."
+
+  $success = $false
+
+  foreach ($task in $tasks) {
+    $taskFullName = "$($task.TaskPath)$($task.TaskName)"
+
+    if ($task.State -eq "Disabled") {
+      Write-Result "Skipping disabled task: $taskFullName" "WARN"
+      continue
+    }
+
+    Write-Result "Starting scheduled task: $taskFullName"
+
+    try {
+      Start-ScheduledTask -TaskName $task.TaskName -TaskPath $task.TaskPath
+
+      $result = Wait-ForTaskToFinish `
+        -TaskName $task.TaskName `
+        -TaskPath $task.TaskPath `
+        -TimeoutSeconds 180
+
+      Write-Result "Task finished with LastTaskResult: $result"
+
+      if ($result -eq 0) {
+        $success = $true
+      }
+    }
+    catch {
+      Write-Result "Failed to start scheduled task: $taskFullName" "WARN"
+    }
+  }
+
+  return $success
+}
+
+function Show-UpdaterDiagnostics {
+  $programFilesX86 = ${env:ProgramFiles(x86)}
+
+  Write-Result "Checking likely Google updater log locations."
+
+  $logCandidates = @(
+    "$programFilesX86\Google\GoogleUpdater\updater.log",
+    "$env:ProgramFiles\Google\GoogleUpdater\updater.log",
+    "$env:LOCALAPPDATA\Google\GoogleUpdater\updater.log",
+    "$programFilesX86\Google\GoogleUpdater\updater_history.jsonl",
+    "$env:LOCALAPPDATA\Google\GoogleUpdater\updater_history.jsonl"
+  )
+
+  foreach ($log in $logCandidates) {
+    if (Test-Path $log) {
+      Write-Result "Found log: $log"
+
+      Write-Host ""
+      Write-Host "---- Last 40 lines of $log ----"
+      Get-Content $log -Tail 40
+      Write-Host "---- End log excerpt ----"
+      Write-Host ""
+    }
+  }
 }
 
 Write-Result "Starting Chrome update check."
 
-$programFilesX86 = ${env:ProgramFiles(x86)}
 $isAdmin = Test-IsAdmin
-
-# Detect Chrome first. If Chrome is not installed, do nothing.
-$chromeCandidates = @(
-  [PSCustomObject]@{
-    Path  = "$env:ProgramFiles\Google\Chrome\Application\chrome.exe"
-    Scope = "Machine"
-  },
-  [PSCustomObject]@{
-    Path  = "$programFilesX86\Google\Chrome\Application\chrome.exe"
-    Scope = "Machine"
-  },
-  [PSCustomObject]@{
-    Path  = "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe"
-    Scope = "User"
-  }
-)
-
-$chromeInfo = $chromeCandidates |
-  Where-Object { Test-Path $_.Path } |
-  Select-Object -First 1
+$chromeInfo = Get-ChromeInstall
 
 if (-not $chromeInfo) {
   Write-Result "Google Chrome is not installed. No action taken." "SKIP"
@@ -107,7 +224,7 @@ Write-Result "Chrome found at: $chrome"
 Write-Result "Detected Chrome install scope: $chromeScope"
 
 if ($chromeScope -eq "Machine" -and -not $isAdmin) {
-  Write-Result "Machine-wide Chrome detected, but PowerShell is not running as Administrator. The updater may fail unless run elevated." "WARN"
+  Write-Result "Machine-wide Chrome detected, but PowerShell is not elevated. Scheduled task/update actions may fail unless run as Administrator or SYSTEM." "WARN"
 }
 
 $startingVersion = Get-ChromeVersion -ChromePath $chrome
@@ -128,75 +245,26 @@ else {
   Write-Result "Chrome is not currently running."
 }
 
-# Prefer legacy updater if present for the same scope.
-$legacyUpdater = $null
+Write-Result "Running existing Google updater through scheduled task registration, not direct updater.exe command line."
 
-if ($chromeScope -eq "Machine") {
-  $legacyUpdater = "$programFilesX86\Google\Update\GoogleUpdate.exe"
+$taskUpdateSucceeded = Invoke-GoogleUpdateScheduledTasks -ChromeScope $chromeScope
+
+if ($taskUpdateSucceeded) {
+  Write-Result "At least one Google updater scheduled task completed successfully."
 }
 else {
-  $legacyUpdater = "$env:LOCALAPPDATA\Google\Update\GoogleUpdate.exe"
+  Write-Result "No Google updater scheduled task reported success." "WARN"
 }
 
-$updaterExitCode = $null
-
-if ($legacyUpdater -and (Test-Path $legacyUpdater)) {
-  Write-Result "Using legacy GoogleUpdate.exe: $legacyUpdater"
-  Write-Result "Updater arguments: /ua /installsource scheduler"
-
-  $process = Start-Process `
-    -FilePath $legacyUpdater `
-    -ArgumentList "/ua /installsource scheduler" `
-    -Wait `
-    -PassThru
-
-  $updaterExitCode = $process.ExitCode
-  Write-Result "Legacy updater finished with exit code: $updaterExitCode"
-}
-else {
-  $newUpdater = Get-LatestUpdater -Scope $chromeScope
-
-  if (-not $newUpdater) {
-    Write-Result "Chrome is installed, but no matching Google updater executable was found. No update action taken." "SKIP"
-    exit 0
-  }
-
-  Write-Result "Using newer Google updater: $($newUpdater.FullName)"
-
-  if ($chromeScope -eq "Machine") {
-    $updaterArgs = @("--update-apps", "--system")
-  }
-  else {
-    $updaterArgs = @("--update-apps")
-  }
-
-  Write-Result "Updater arguments: $($updaterArgs -join ' ')"
-
-  $process = Start-Process `
-    -FilePath $newUpdater.FullName `
-    -ArgumentList $updaterArgs `
-    -Wait `
-    -PassThru
-
-  $updaterExitCode = $process.ExitCode
-  Write-Result "Newer updater finished with exit code: $updaterExitCode"
-
-  if ($updaterExitCode -eq 75009) {
-    Write-Result "Updater still returned 75009. This is coming from the existing Google updater itself, not winget or the script fallback." "WARN"
-    Write-Result "For machine-wide Chrome, confirm the script is running elevated or as SYSTEM." "WARN"
-  }
-}
-
-# Only open/close Chrome if it was not already running.
 if (-not $chromeWasRunning) {
-  Write-Result "Opening Chrome to chrome://settings/help so Chrome can process update state."
+  Write-Result "Opening Chrome to chrome://settings/help to trigger Chrome's own update check path."
 
   $startedAt = Get-Date
 
   Start-Process $chrome -ArgumentList "chrome://settings/help"
 
-  Write-Result "Waiting 30 seconds."
-  Start-Sleep -Seconds 30
+  Write-Result "Waiting 60 seconds for Chrome to process update state."
+  Start-Sleep -Seconds 60
 
   $startedChromeProcesses = Get-Process chrome |
     Where-Object {
@@ -223,7 +291,7 @@ if (-not $chromeWasRunning) {
       }
     }
 
-    Start-Sleep -Seconds 5
+    Start-Sleep -Seconds 10
 
     $remainingChromeProcesses = Get-Process chrome |
       Where-Object {
@@ -247,6 +315,8 @@ if (-not $chromeWasRunning) {
   else {
     Write-Result "No Chrome processes started by this script were found to close."
   }
+
+  Start-Sleep -Seconds 5
 }
 else {
   Write-Result "Chrome was already running before this script started, so no Chrome windows were opened or closed."
@@ -266,13 +336,11 @@ if ($startingVersion -and $endingVersion) {
     Write-Result "Chrome update completed. Version changed from $startingVersion to $endingVersion." "SUCCESS"
   }
   else {
-    Write-Result "Chrome version did not change. It may already be current, no update was available, or the update requires a later browser restart." "INFO"
+    Write-Result "Chrome version did not change. It may already be current, the updater failed internally, or the update requires a later restart." "INFO"
   }
 }
 
-Write-Result "Possible updater logs:"
-Write-Result "$programFilesX86\Google\GoogleUpdater\updater.log"
-Write-Result "$env:LOCALAPPDATA\Google\GoogleUpdater\updater.log"
+Show-UpdaterDiagnostics
 
 Write-Result "Chrome update script completed."
 exit 0
