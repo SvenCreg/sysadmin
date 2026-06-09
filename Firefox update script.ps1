@@ -1,661 +1,97 @@
-# Name: Update-AdobeAcrobatAdjacent.ps1
-# Description:
-#   Detects Adobe Acrobat / Adobe Acrobat Reader only, determines product and architecture,
-#   downloads the latest matching Continuous Track MSP update from Adobe, and installs it silently.
-#
-# Designed for ConnectWise RMM execution as System/elevated PowerShell.
-#
-# Default safety behavior:
-#   - If Acrobat/Reader appears to be running, the script exits 0 and does NOT update.
-#   - It does NOT close Adobe apps.
-#   - It does NOT require launch flags.
-#
-# Cleanup behavior:
-#   - Downloaded MSP patch files are removed after successful installation.
-#   - Reader MSPs that return "patch not applicable" during MUI/non-MUI fallback are also removed.
-#   - Logs are kept for troubleshooting.
-#
-# Scope:
-#   - Adobe Acrobat Continuous Track
-#   - Adobe Acrobat Reader Continuous Track
-#   - x86 and x64
-#   - Reader MUI and non-MUI
-#
-# Does NOT patch:
-#   - Photoshop, Illustrator, Creative Cloud, etc.
-#   - Adobe Genuine Service
-#   - Adobe Acrobat Update Service only
-#   - Classic/2020/2024/legacy Acrobat tracks
+<#
+================================================================================
+Firefox Silent Install / Update Script (UPDATE-ONLY)
 
-$ErrorActionPreference = "Stop"
+This script will:
+- ONLY update existing Firefox installations
+- NOT install Firefox if it is missing
 
-# =========================
-# ConnectWise RMM settings
-# =========================
+HOW TO UPDATE FOR A NEW FIREFOX VERSION:
+----------------------------------------
+Update these two values ONLY:
+1) $TargetVersion
+2) Version embedded in $DownloadUrl
+================================================================================
+#>
 
-$WorkingDirectory = "C:\ProgramData\AdobeAcrobatUpdate"
+# Target Firefox version you want installed
+$TargetVersion = [Version] "146.0"
 
-# No launch flags needed.
-# If Acrobat/Reader is running, the script safely exits before download/install.
+# Firefox download URL (must match the TargetVersion above)
+$DownloadUrl = "https://download.mozilla.org/?product=firefox-146.0-ssl&os=win64&lang=en-US"
 
-# Reader MUI detection is not always obvious from registry.
-# AutoTryBoth tries the likely Reader MSP first, then tries the alternate
-# Reader MSP only if MSI says the patch is not applicable.
-#
-# Valid values:
-#   AutoTryBoth
-#   ForceMUI
-#   ForceSingleLanguage
-$ReaderPatchPreference = "AutoTryBoth"
+# Local path where the installer will be downloaded
+$LocalInstaller = "C:\Temp\Firefox Installer.exe"
 
-# Set to $true only for testing download logic without installing.
-$DownloadOnly = $false
-
-# Remove downloaded MSP files after successful use.
-# Logs are still retained.
-$CleanupDownloadedPatches = $true
-
-# =========================
-# Adobe release notes source
-# =========================
-
-$ReleaseNotesIndexUrl = "https://www.adobe.com/devnet-docs/acrobatetk/tools/ReleaseNotesDC/index.html"
-
+# -------------------------------------------------------------------------
+# Detect existing Firefox installation via registry
+# -------------------------------------------------------------------------
+$firefoxExePath = $null
 try {
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-}
-catch {
-    # Ignore on newer PowerShell versions.
-}
-
-New-Item -ItemType Directory -Path $WorkingDirectory -Force | Out-Null
-
-$LogFile = Join-Path $WorkingDirectory "AdobeAcrobatAdjacentUpdate.log"
-
-function Write-Log {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Message
-    )
-
-    $line = "$(Get-Date -Format s) $Message"
-    Write-Host $line
-    Add-Content -Path $LogFile -Value $line
+    $reg = Get-ItemProperty `
+        -Path "HKLM:\Software\Microsoft\Windows\CurrentVersion\App Paths\firefox.exe" `
+        -ErrorAction Stop
+    $firefoxExePath = $reg.Path
+} catch {
+    # Firefox not found
 }
 
-function Get-PropertyValue {
-    param(
-        [Parameter(Mandatory = $true)]
-        [object]$Object,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Name
-    )
-
-    $property = $Object.PSObject.Properties[$Name]
-
-    if ($null -eq $property) {
-        return $null
-    }
-
-    return $property.Value
-}
-
-function Resolve-Url {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$BaseUrl,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Href
-    )
-
-    if ($Href -match "^https?://") {
-        return $Href
-    }
-
-    return ([Uri]::new([Uri]$BaseUrl, $Href)).AbsoluteUri
-}
-
-function Compare-VersionSafe {
-    param(
-        [string]$InstalledVersion,
-        [string]$LatestVersion
-    )
-
-    try {
-        return ([version]$InstalledVersion).CompareTo([version]$LatestVersion)
-    }
-    catch {
-        return $null
-    }
-}
-
-function Remove-DownloadedPatchFile {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$PatchPath
-    )
-
-    if (-not $CleanupDownloadedPatches) {
-        Write-Log "Cleanup is disabled. Leaving downloaded patch file in place: $PatchPath"
-        return
-    }
-
-    if (-not (Test-Path $PatchPath)) {
-        return
-    }
-
-    try {
-        Remove-Item -Path $PatchPath -Force -ErrorAction Stop
-        Write-Log "Removed downloaded patch file: $PatchPath"
-    }
-    catch {
-        Write-Log "Could not remove downloaded patch file '$PatchPath': $($_.Exception.Message)"
-    }
-}
-
-function Get-RunningAdobeUserProcesses {
-    # Conservative by design.
-    # If any of these are running, Acrobat/Reader may have open user documents.
-    $processNames = @(
-        "Acrobat.exe",
-        "AcroRd32.exe",
-        "AcroCEF.exe",
-        "RdrCEF.exe"
-    )
-
-    $running = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-        Where-Object { $processNames -contains $_.Name }
-
-    $results = New-Object System.Collections.Generic.List[object]
-
-    foreach ($process in $running) {
-        $ownerName = "Unknown"
-
-        try {
-            $owner = Invoke-CimMethod -InputObject $process -MethodName GetOwner -ErrorAction SilentlyContinue
-
-            if ($owner -and $owner.User) {
-                if ($owner.Domain) {
-                    $ownerName = "$($owner.Domain)\$($owner.User)"
-                }
-                else {
-                    $ownerName = $owner.User
-                }
-            }
-        }
-        catch {
-            $ownerName = "Unknown"
-        }
-
-        $results.Add([PSCustomObject]@{
-            Name        = $process.Name
-            ProcessId   = $process.ProcessId
-            SessionId   = $process.SessionId
-            Owner       = $ownerName
-            CommandLine = $process.CommandLine
-        })
-    }
-
-    return $results
-}
-
-function Get-InstalledAdobeAcrobatAdjacentProducts {
-    $uninstallRoots = @(
-        @{
-            Path = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"
-            RegistryArchitecture = "x64"
-        },
-        @{
-            Path = "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
-            RegistryArchitecture = "x86"
-        }
-    )
-
-    $results = New-Object System.Collections.Generic.List[object]
-
-    foreach ($root in $uninstallRoots) {
-        $items = Get-ItemProperty -Path $root.Path -ErrorAction SilentlyContinue
-
-        foreach ($item in $items) {
-            $displayName = Get-PropertyValue -Object $item -Name "DisplayName"
-
-            if ([string]::IsNullOrWhiteSpace($displayName)) {
-                continue
-            }
-
-            # Include Adobe Acrobat / Reader only.
-            $isAcrobatFamily =
-                $displayName -match "^Adobe\s+Acrobat(\s+Reader)?\b" -or
-                $displayName -match "^Adobe\s+Reader\b"
-
-            if (-not $isAcrobatFamily) {
-                continue
-            }
-
-            # Exclude adjacent services/components that are not the app itself.
-            if ($displayName -match "(Update\s+Service|Refresh\s+Manager|Synchronizer|Genuine|ARM|Notification|Collaboration|Core\s+Sync)") {
-                continue
-            }
-
-            $publisher       = Get-PropertyValue -Object $item -Name "Publisher"
-            $displayVersion  = Get-PropertyValue -Object $item -Name "DisplayVersion"
-            $installLocation = Get-PropertyValue -Object $item -Name "InstallLocation"
-            $uninstallString = Get-PropertyValue -Object $item -Name "UninstallString"
-            $psPath          = Get-PropertyValue -Object $item -Name "PSPath"
-
-            if ($publisher -and $publisher -notmatch "Adobe") {
-                continue
-            }
-
-            $productType = "Acrobat"
-
-            if ($displayName -match "Reader" -or $displayName -match "^Adobe\s+Reader\b") {
-                $productType = "Reader"
-            }
-
-            $architecture = $null
-
-            if ($displayName -match "(64-bit|x64)") {
-                $architecture = "x64"
-            }
-            elseif ($displayName -match "(32-bit|x86)") {
-                $architecture = "x86"
-            }
-            elseif ($installLocation -match "\(x86\)" -or $uninstallString -match "\(x86\)" -or $psPath -match "WOW6432Node") {
-                $architecture = "x86"
-            }
-            elseif ($root.RegistryArchitecture -eq "x86") {
-                $architecture = "x86"
-            }
-            else {
-                $architecture = "x64"
-            }
-
-            $track = "ContinuousAssumed"
-
-            # Avoid forcing Continuous Track MSPs onto Classic/legacy installs.
-            if (
-                $displayName -match "(Classic|2020|2024|2017|2015| XI\b| X\b)" -or
-                $installLocation -match "(Acrobat\s+2020|Acrobat\s+2024|Acrobat\s+2017|Acrobat\s+2015|Acrobat\s+XI|Acrobat\s+X)"
-            ) {
-                $track = "UnsupportedOrClassic"
-            }
-
-            $isMui = $false
-
-            if (
-                $displayName -match "\bMUI\b" -or
-                $installLocation -match "\bMUI\b" -or
-                $uninstallString -match "\bMUI\b"
-            ) {
-                $isMui = $true
-            }
-
-            $results.Add([PSCustomObject]@{
-                DisplayName      = $displayName
-                DisplayVersion   = $displayVersion
-                ProductType      = $productType
-                Architecture     = $architecture
-                Track            = $track
-                IsMUI            = $isMui
-                InstallLocation  = $installLocation
-                UninstallString  = $uninstallString
-                RegistryPath     = $psPath
-            })
-        }
-    }
-
-    $results |
-        Sort-Object ProductType, Architecture, DisplayName, DisplayVersion -Unique
-}
-
-function Get-LatestAdobeContinuousRelease {
-    Write-Log "Checking Adobe Continuous Track release notes."
-
-    $response = Invoke-WebRequest -UseBasicParsing -Uri $ReleaseNotesIndexUrl
-    $content = $response.Content
-
-    $matches = [regex]::Matches(
-        $content,
-        '<a\s+[^>]*href="(?<href>continuous/[^"]+)"[^>]*>.*?(?<version>\d{2}\.\d{3}\.\d{5}).*?</a>',
-        [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor
-        [System.Text.RegularExpressions.RegexOptions]::Singleline
-    )
-
-    if ($matches.Count -eq 0) {
-        throw "Could not find Continuous Track release links on Adobe release notes page."
-    }
-
-    $releases = foreach ($match in $matches) {
-        $version = $match.Groups["version"].Value
-        $href = $match.Groups["href"].Value
-
-        [PSCustomObject]@{
-            Version     = $version
-            SortVersion = [version]$version
-            Url         = Resolve-Url -BaseUrl $ReleaseNotesIndexUrl -Href $href
-        }
-    }
-
-    $latest = $releases |
-        Sort-Object SortVersion -Descending |
-        Select-Object -First 1
-
-    if (-not $latest) {
-        throw "Could not determine latest Adobe Continuous Track version."
-    }
-
-    Write-Log "Latest Adobe Continuous Track version detected: $($latest.Version)"
-    Write-Log "Latest Adobe release page: $($latest.Url)"
-
-    return $latest
-}
-
-function Get-AcrobatPatchFileName {
-    param(
-        [Parameter(Mandatory = $true)]
-        [ValidateSet("x86", "x64")]
-        [string]$Architecture,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Version
-    )
-
-    $versionNoDots = $Version.Replace(".", "")
-    $archText = ""
-
-    if ($Architecture -eq "x64") {
-        $archText = "x64"
-    }
-
-    return "AcrobatDC$($archText)Upd$versionNoDots.msp"
-}
-
-function Get-ReaderPatchFileNames {
-    param(
-        [Parameter(Mandatory = $true)]
-        [ValidateSet("x86", "x64")]
-        [string]$Architecture,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Version,
-
-        [Parameter(Mandatory = $true)]
-        [bool]$DetectedMUI
-    )
-
-    $versionNoDots = $Version.Replace(".", "")
-    $archText = ""
-
-    if ($Architecture -eq "x64") {
-        $archText = "x64"
-    }
-
-    $singleLanguagePatch = "AcroRdrDC$($archText)Upd$versionNoDots.msp"
-    $muiPatch = "AcroRdrDC$($archText)Upd$($versionNoDots)_MUI.msp"
-
-    switch ($ReaderPatchPreference) {
-        "ForceMUI" {
-            return @($muiPatch)
-        }
-        "ForceSingleLanguage" {
-            return @($singleLanguagePatch)
-        }
-        default {
-            if ($DetectedMUI) {
-                return @($muiPatch, $singleLanguagePatch)
-            }
-            else {
-                return @($singleLanguagePatch, $muiPatch)
-            }
-        }
-    }
-}
-
-function Get-AdobePatchUrl {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$ReleaseUrl,
-
-        [Parameter(Mandatory = $true)]
-        [string]$PatchFileName
-    )
-
-    Write-Log "Looking for patch file on Adobe release page: $PatchFileName"
-
-    $response = Invoke-WebRequest -UseBasicParsing -Uri $ReleaseUrl
-
-    $escapedFileName = [regex]::Escape($PatchFileName)
-
-    try {
-        $link = $response.Links |
-            Where-Object { $_.href -match $escapedFileName } |
-            Select-Object -First 1
-
-        if ($link -and $link.href) {
-            return Resolve-Url -BaseUrl $ReleaseUrl -Href $link.href
-        }
-    }
-    catch {
-        # Fall through to raw HTML parsing.
-    }
-
-    $hrefMatch = [regex]::Match(
-        $response.Content,
-        'href="(?<href>[^"]*' + $escapedFileName + '[^"]*)"',
-        [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
-    )
-
-    if ($hrefMatch.Success) {
-        return Resolve-Url -BaseUrl $ReleaseUrl -Href $hrefMatch.Groups["href"].Value
-    }
-
-    throw "Could not find patch file '$PatchFileName' on Adobe release page."
-}
-
-function Install-AdobePatch {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$PatchPath
-    )
-
-    $msiLog = Join-Path $WorkingDirectory ("msiexec-" + [IO.Path]::GetFileNameWithoutExtension($PatchPath) + ".log")
-
-    # /p applies the MSP patch.
-    # /qn runs silently.
-    # /norestart prevents surprise reboot.
-    # /L*v creates a verbose MSI log.
-    $arguments = "/p `"$PatchPath`" /qn /norestart /L*v `"$msiLog`""
-
-    Write-Log "Running: msiexec.exe $arguments"
-
-    $process = Start-Process -FilePath "msiexec.exe" -ArgumentList $arguments -Wait -PassThru
-
-    Write-Log "msiexec exit code: $($process.ExitCode)"
-    Write-Log "MSI log: $msiLog"
-
-    return $process.ExitCode
-}
-
-function Test-MsiSuccessCode {
-    param([int]$ExitCode)
-
-    return $ExitCode -in @(0, 3010, 1641)
-}
-
-# =========================
-# Main execution
-# =========================
-
-Write-Log "Starting Adobe Acrobat/Reader update process."
-
-$products = @(Get-InstalledAdobeAcrobatAdjacentProducts)
-
-if ($products.Count -eq 0) {
-    Write-Log "No Adobe Acrobat or Adobe Acrobat Reader products detected. Nothing to update."
+# -------------------------------------------------------------------------
+# Exit if Firefox is NOT installed
+# -------------------------------------------------------------------------
+if (-not $firefoxExePath -or -not (Test-Path $firefoxExePath)) {
+    Write-Host "Firefox is not installed. No action taken."
     exit 0
 }
 
-Write-Log "Detected $($products.Count) Acrobat-adjacent product(s)."
+# -------------------------------------------------------------------------
+# Read installed Firefox version
+# -------------------------------------------------------------------------
+$installedVersionString = (Get-Item $firefoxExePath).VersionInfo.ProductVersion
+$installedVersion = [Version] $installedVersionString
 
-foreach ($product in $products) {
-    Write-Log "Detected product: $($product.DisplayName) | Version: $($product.DisplayVersion) | Type: $($product.ProductType) | Arch: $($product.Architecture) | Track: $($product.Track) | MUI detected: $($product.IsMUI)"
-}
+Write-Host "Installed version: $installedVersion"
+Write-Host "Target version:    $TargetVersion"
 
-# Safety check: do not update while Adobe is running.
-$runningAdobeProcesses = @(Get-RunningAdobeUserProcesses)
-
-if ($runningAdobeProcesses.Count -gt 0) {
-    Write-Log "Adobe Acrobat/Reader appears to be in use. Skipping update to avoid closing user documents."
-
-    foreach ($process in $runningAdobeProcesses) {
-        Write-Log "Running Adobe process detected: $($process.Name) | PID: $($process.ProcessId) | Session: $($process.SessionId) | Owner: $($process.Owner)"
-    }
-
-    Write-Log "Exiting without installing. ConnectWise can retry on the next scheduled run."
+# -------------------------------------------------------------------------
+# Compare versions
+# -------------------------------------------------------------------------
+if ($installedVersion -ge $TargetVersion) {
+    Write-Host "Installed version is up to date. No action needed."
     exit 0
 }
 
-$latestRelease = Get-LatestAdobeContinuousRelease
-$latestVersion = $latestRelease.Version
+Write-Host "Installed version is older. Updating Firefox..."
 
-$overallExitCode = 0
-$updatedSomething = $false
-
-foreach ($product in $products) {
-    Write-Log "Evaluating product: $($product.DisplayName)"
-
-    if ($product.Track -eq "UnsupportedOrClassic") {
-        Write-Log "Skipping '$($product.DisplayName)' because it appears to be Classic/2020/2024/legacy or otherwise unsupported by this Continuous Track MSP script."
-        continue
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace($product.DisplayVersion)) {
-        $comparison = Compare-VersionSafe -InstalledVersion $product.DisplayVersion -LatestVersion $latestVersion
-
-        if ($null -eq $comparison) {
-            Write-Log "Could not compare installed version '$($product.DisplayVersion)' to latest '$latestVersion'. Continuing with update attempt."
-        }
-        elseif ($comparison -ge 0) {
-            Write-Log "'$($product.DisplayName)' is already current or newer. Installed: $($product.DisplayVersion), latest: $latestVersion."
-            continue
-        }
-        else {
-            Write-Log "'$($product.DisplayName)' requires update. Installed: $($product.DisplayVersion), latest: $latestVersion."
-        }
-    }
-    else {
-        Write-Log "Installed version is missing for '$($product.DisplayName)'. Continuing with update attempt."
-    }
-
-    if ($product.ProductType -eq "Acrobat") {
-        $candidatePatchFiles = @(
-            Get-AcrobatPatchFileName -Architecture $product.Architecture -Version $latestVersion
-        )
-    }
-    else {
-        $candidatePatchFiles = @(
-            Get-ReaderPatchFileNames `
-                -Architecture $product.Architecture `
-                -Version $latestVersion `
-                -DetectedMUI ([bool]$product.IsMUI)
-        )
-    }
-
-    $productUpdated = $false
-    $lastExitCode = 0
-
-    foreach ($patchFileName in $candidatePatchFiles) {
-        Write-Log "Trying patch candidate for '$($product.DisplayName)': $patchFileName"
-
-        try {
-            $patchUrl = Get-AdobePatchUrl -ReleaseUrl $latestRelease.Url -PatchFileName $patchFileName
-        }
-        catch {
-            Write-Log "Could not resolve patch URL for '$patchFileName': $($_.Exception.Message)"
-            $lastExitCode = 1
-            continue
-        }
-
-        $patchPath = Join-Path $WorkingDirectory $patchFileName
-
-        try {
-            Write-Log "Downloading patch: $patchUrl"
-            Invoke-WebRequest -UseBasicParsing -Uri $patchUrl -OutFile $patchPath
-        }
-        catch {
-            Write-Log "Failed to download patch '$patchFileName': $($_.Exception.Message)"
-            $lastExitCode = 1
-            continue
-        }
-
-        if (-not (Test-Path $patchPath)) {
-            Write-Log "Patch download did not create expected file: $patchPath"
-            $lastExitCode = 1
-            continue
-        }
-
-        Write-Log "Patch downloaded successfully: $patchPath"
-
-        if ($DownloadOnly) {
-            Write-Log "DownloadOnly is enabled. Skipping installation and leaving patch file in place: $patchPath"
-            $productUpdated = $true
-            break
-        }
-
-        try {
-            $exitCode = Install-AdobePatch -PatchPath $patchPath
-            $lastExitCode = $exitCode
-
-            if (Test-MsiSuccessCode -ExitCode $exitCode) {
-                Write-Log "Patch succeeded for '$($product.DisplayName)' using '$patchFileName'."
-                Remove-DownloadedPatchFile -PatchPath $patchPath
-
-                $updatedSomething = $true
-                $productUpdated = $true
-                break
-            }
-
-            if ($product.ProductType -eq "Reader" -and $exitCode -eq 1642) {
-                Write-Log "MSI exit code 1642 means this patch is not applicable. For Reader, trying the alternate MUI/non-MUI patch if available."
-                Remove-DownloadedPatchFile -PatchPath $patchPath
-                continue
-            }
-
-            Write-Log "Patch failed for '$($product.DisplayName)' using '$patchFileName' with exit code $exitCode."
-            Write-Log "Leaving downloaded patch file for troubleshooting: $patchPath"
-        }
-        catch {
-            Write-Log "Exception while installing '$patchFileName': $($_.Exception.Message)"
-            Write-Log "Leaving downloaded patch file for troubleshooting: $patchPath"
-            $lastExitCode = 1
-        }
-    }
-
-    if (-not $productUpdated) {
-        Write-Log "No patch candidate completed successfully for '$($product.DisplayName)'."
-
-        if ($lastExitCode -ne 0) {
-            $overallExitCode = $lastExitCode
-        }
-        else {
-            $overallExitCode = 1
-        }
-    }
+# -------------------------------------------------------------------------
+# Ensure the destination directory exists
+# -------------------------------------------------------------------------
+$destDir = Split-Path $LocalInstaller -Parent
+if (-not (Test-Path $destDir)) {
+    New-Item -ItemType Directory -Path $destDir -Force | Out-Null
 }
 
-if ($overallExitCode -eq 0) {
-    if ($updatedSomething) {
-        Write-Log "Adobe Acrobat/Reader update process completed successfully."
-    }
-    else {
-        Write-Log "No applicable Adobe Acrobat/Reader products required installation."
-    }
-
-    exit 0
+# -------------------------------------------------------------------------
+# Download the Firefox installer
+# -------------------------------------------------------------------------
+Write-Host "Downloading Firefox $TargetVersion installer..."
+try {
+    Invoke-WebRequest -Uri $DownloadUrl -OutFile $LocalInstaller -UseBasicParsing -ErrorAction Stop
+} catch {
+    Write-Error "Download failed: $_"
+    exit 1
 }
 
-Write-Log "Adobe Acrobat/Reader update process completed with errors. Exit code: $overallExitCode"
-exit $overallExitCode
+# -------------------------------------------------------------------------
+# Silently run the installer (update only)
+# -------------------------------------------------------------------------
+Write-Host "Running installer..."
+Start-Process -FilePath $LocalInstaller -ArgumentList "-ms" -Wait -NoNewWindow
+
+# -------------------------------------------------------------------------
+# Clean up installer file
+# -------------------------------------------------------------------------
+if (Test-Path $LocalInstaller) {
+    Write-Host "Cleaning up installer file..."
+    Remove-Item -Path $LocalInstaller -Force -ErrorAction SilentlyContinue
+}
